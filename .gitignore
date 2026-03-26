@@ -7,3 +7,15 @@ build/
 *.tar
 *.pyd
 *.egg-info
+
+# Test data (large raw video files)
+test_data/
+*.yuv
+*.7z
+
+# Model checkpoints
+checkpoints/
+
+# Output
+out_bin/
+output*.json
