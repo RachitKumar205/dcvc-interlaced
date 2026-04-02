@@ -382,21 +382,21 @@ class DMC(CompressionModel):
         feature_b = feature[1:2]
 
         # --- Phase 2: pre-compute entropy inputs on main thread ---
-        # build_indexes_encoder flattens to 1D, so compute per frame before threading
-        # to avoid interleaved symbol streams. Also move to CPU here to avoid CUDA
-        # context issues inside threads.
+        # build_indexes_encoder flattens to 1D, so compute per frame slice separately
+        # before threading to avoid interleaved symbol streams.
+        # All tensors are moved to CPU here so threads never touch the CUDA context.
         _, _, Hz, Wz = z_hat_write.shape
-        z_np_a = z_hat_write[0:1].reshape(-1).to(torch.int8).cpu().numpy()
-        z_np_b = z_hat_write[1:2].reshape(-1).to(torch.int8).cpu().numpy()
+        z_t_a = z_hat_write[0:1].reshape(-1).cpu()   # tensor, EntropyCoder.encode_z does .to(int8)
+        z_t_b = z_hat_write[1:2].reshape(-1).cpu()
 
         sym_y0_a = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_0[0:1], s_w_0[0:1]).cpu().numpy()
+            y_q_w_0[0:1], s_w_0[0:1]).cpu()           # int16 tensor
         sym_y0_b = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_0[1:2], s_w_0[1:2]).cpu().numpy()
+            y_q_w_0[1:2], s_w_0[1:2]).cpu()
         sym_y1_a = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_1[0:1], s_w_1[0:1]).cpu().numpy()
+            y_q_w_1[0:1], s_w_1[0:1]).cpu()
         sym_y1_b = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_1[1:2], s_w_1[1:2]).cpu().numpy()
+            y_q_w_1[1:2], s_w_1[1:2]).cpu()
 
         z_channel = self.bit_estimator_z.channel
         cdf_info_z = self.bit_estimator_z.get_cdf_info()
@@ -408,20 +408,20 @@ class DMC(CompressionModel):
         # cdf_group_index values used when pre-computing the symbols above.
         results = [None, None]
 
-        def _encode(idx, z_np, sym_y0, sym_y1):
+        def _encode(idx, z_t, sym_y0, sym_y1):
             coder = EntropyCoder()
             coder.set_use_two_entropy_coders(use_two_entropy_coders)
             cdf_idx_z = coder.add_cdf(*cdf_info_z)
             cdf_idx_y = coder.add_cdf(*cdf_info_y)
             coder.reset()
-            coder.encode_z(z_np, cdf_idx_z, qp * z_channel, Hz * Wz)
+            coder.encode_z(z_t, cdf_idx_z, qp * z_channel, Hz * Wz)
             coder.encode_y(sym_y0, cdf_idx_y)
             coder.encode_y(sym_y1, cdf_idx_y)
             coder.flush()
             results[idx] = coder.get_encoded_stream()
 
-        t_a = threading.Thread(target=_encode, args=(0, z_np_a, sym_y0_a, sym_y1_a))
-        t_b = threading.Thread(target=_encode, args=(1, z_np_b, sym_y0_b, sym_y1_b))
+        t_a = threading.Thread(target=_encode, args=(0, z_t_a, sym_y0_a, sym_y1_a))
+        t_b = threading.Thread(target=_encode, args=(1, z_t_b, sym_y0_b, sym_y1_b))
         t_a.start()
         t_b.start()
         t_a.join()
