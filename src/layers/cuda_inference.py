@@ -19,6 +19,8 @@ except Exception:  # pylint: disable=W0718
     pass
 
 
+CUSTOMIZED_CUDA_INFERENCE = False  # force PyTorch path for B>1 batching testing
+
 if not CUSTOMIZED_CUDA_INFERENCE and 'SUPPRESS_CUSTOM_KERNEL_WARNING' not in os.environ:
     print("cannot import cuda implementation for inference, fallback to pytorch.")
 
