@@ -1,11 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import threading
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from .common_model import CompressionModel
+from .entropy_models import EntropyCoder
 from ..layers.layers import SubpelConv2x, DepthConvBlock, \
     ResidualBlockUpsample, ResidualBlockWithStride2
 from ..layers.cuda_inference import CUSTOMIZED_CUDA_INFERENCE, round_and_to_int8, \
@@ -339,6 +342,92 @@ class DMC(CompressionModel):
         return {
             'bit_stream': bit_stream,
         }
+
+    def compress_batch(self, x, qp, ref_feature_a, ref_feature_b, use_two_entropy_coders):
+        """
+        Encode a pair of P-frames with a single B=2 GPU forward pass followed by
+        parallel CPU entropy coding on two threads.
+
+        ref_feature_a and ref_feature_b must be already-materialised [1, g_ch_d, H', W']
+        tensors produced by the caller via materialise_feature().
+
+        Returns (bit_stream_a, bit_stream_b, feature_a, feature_b).
+        feature_a/b are [1, g_ch_d, H', W'] and should be stored back into the
+        caller's per-stream RefFrame.feature.
+        """
+        assert x.shape[0] == 2
+        device = x.device
+
+        q_encoder = self.q_encoder[qp:qp+1, :, :, :]
+        q_decoder = self.q_decoder[qp:qp+1, :, :, :]
+        q_feature = self.q_feature[qp:qp+1, :, :, :]
+
+        # --- Phase 1: B=2 GPU forward ---
+        # Both ref features have already been run through feature_adaptor_* by the caller,
+        # matching exactly what compress() does via apply_feature_adaptor().
+        feature = torch.cat((ref_feature_a, ref_feature_b), dim=0)  # [2, g_ch_d, H', W']
+
+        ctx, ctx_t = self.feature_extractor(feature, q_feature)
+        y = self.encoder(x, ctx, q_encoder)
+        z = self.hyper_encoder(self.pad_for_y(y))
+        z_hat, z_hat_write = round_and_to_int8(z)
+        params = self.res_prior_param_decoder(z_hat, ctx_t)
+        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+            self.compress_prior_2x(y, params, self.y_spatial_prior)
+        feature = self.decoder(y_hat, ctx, q_decoder)   # [2, g_ch_d, H', W']
+
+        torch.cuda.synchronize(device=device)
+
+        feature_a = feature[0:1]
+        feature_b = feature[1:2]
+
+        # --- Phase 2: pre-compute entropy inputs on main thread ---
+        # build_indexes_encoder flattens to 1D, so compute per frame before threading
+        # to avoid interleaved symbol streams. Also move to CPU here to avoid CUDA
+        # context issues inside threads.
+        _, _, Hz, Wz = z_hat_write.shape
+        z_np_a = z_hat_write[0:1].reshape(-1).to(torch.int8).cpu().numpy()
+        z_np_b = z_hat_write[1:2].reshape(-1).to(torch.int8).cpu().numpy()
+
+        sym_y0_a = self.gaussian_encoder.build_indexes_encoder(
+            y_q_w_0[0:1], s_w_0[0:1]).cpu().numpy()
+        sym_y0_b = self.gaussian_encoder.build_indexes_encoder(
+            y_q_w_0[1:2], s_w_0[1:2]).cpu().numpy()
+        sym_y1_a = self.gaussian_encoder.build_indexes_encoder(
+            y_q_w_1[0:1], s_w_1[0:1]).cpu().numpy()
+        sym_y1_b = self.gaussian_encoder.build_indexes_encoder(
+            y_q_w_1[1:2], s_w_1[1:2]).cpu().numpy()
+
+        z_channel = self.bit_estimator_z.channel
+        cdf_info_z = self.bit_estimator_z.get_cdf_info()
+        cdf_info_y = self.gaussian_encoder.get_cdf_info()
+
+        # --- Phase 3: parallel entropy coding on two threads ---
+        # Each thread gets its own fresh EntropyCoder with CDFs registered in the
+        # same order (bit_estimator_z first, gaussian_encoder second), matching the
+        # cdf_group_index values used when pre-computing the symbols above.
+        results = [None, None]
+
+        def _encode(idx, z_np, sym_y0, sym_y1):
+            coder = EntropyCoder()
+            coder.set_use_two_entropy_coders(use_two_entropy_coders)
+            cdf_idx_z = coder.add_cdf(*cdf_info_z)
+            cdf_idx_y = coder.add_cdf(*cdf_info_y)
+            coder.reset()
+            coder.encode_z(z_np, cdf_idx_z, qp * z_channel, Hz * Wz)
+            coder.encode_y(sym_y0, cdf_idx_y)
+            coder.encode_y(sym_y1, cdf_idx_y)
+            coder.flush()
+            results[idx] = coder.get_encoded_stream()
+
+        t_a = threading.Thread(target=_encode, args=(0, z_np_a, sym_y0_a, sym_y1_a))
+        t_b = threading.Thread(target=_encode, args=(1, z_np_b, sym_y0_b, sym_y1_b))
+        t_a.start()
+        t_b.start()
+        t_a.join()
+        t_b.join()
+
+        return results[0], results[1], feature_a, feature_b
 
     def decompress(self, bit_stream, sps, qp):
         dtype = next(self.parameters()).dtype

@@ -32,11 +32,12 @@ import time
 import threading
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
 from src.layers.cuda_inference import replicate_pad
-from src.models.video_model import DMC
+from src.models.video_model import DMC, RefFrame
 from src.models.image_model import DMCI
 from src.utils.common import str2bool, create_folder, generate_log_json, get_state_dict, \
     dump_json, set_torch_env
@@ -166,6 +167,21 @@ def restore_dpb_state(p_frame_net, state):
     p_frame_net.curr_poc = state['curr_poc']
 
 
+def materialise_feature(p_frame_net, ref_frame):
+    """
+    Return the [1, g_ch_d, H, W] reference feature for a stream's RefFrame,
+    mirroring what DMC.apply_feature_adaptor() does internally but without
+    touching p_frame_net.dpb.
+
+    After a P-frame: ref_frame.feature is set — run through feature_adaptor_p.
+    After an I-frame: ref_frame.feature is None, ref_frame.frame holds x_hat
+                      — run through feature_adaptor_i after pixel_unshuffle.
+    """
+    if ref_frame.feature is not None:
+        return p_frame_net.feature_adaptor_p(ref_frame.feature)
+    return p_frame_net.feature_adaptor_i(F.pixel_unshuffle(ref_frame.frame, 8))
+
+
 # ---------------------------------------------------------------------------
 # Interlaced encode
 # ---------------------------------------------------------------------------
@@ -176,8 +192,13 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
     Encode all frames using micro-interlaced coding.
 
     The video is split into Stream A (even indices) and Stream B (odd indices).
-    Each stream is an independent autoregressive chain so consecutive pairs
-    can be encoded concurrently.
+    Each stream is an independent autoregressive chain.
+
+    I-frame pairs (pair_idx == 0) are encoded sequentially — they are not
+    batchable because i_frame_net.compress() has a stateful entropy coder.
+
+    All P-frame pairs use p_frame_net.compress_batch(): a single B=2 GPU
+    forward pass followed by parallel entropy coding on two threads.
 
     Returns:
         frame_types  - list of 0 (I) or 1 (P) per original frame index
@@ -189,91 +210,40 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
     reset_interval = args['reset_interval']
     verbose = args['verbose']
 
-    # Output arrays indexed by original frame position
-    frame_types = [None] * frame_num
-    bits = [None] * frame_num
-    encoding_times = [None] * frame_num
+    frame_types = [0] * frame_num
+    bits = [0] * frame_num
+    encoding_times = [0.0] * frame_num
 
-    # Each stream maintains its own DPB state independently.
-    # We save/restore around every compress() call so the single p_frame_net
-    # instance serves both streams without interference.
-    state_a = None  # DPB state for stream A (even frames)
-    state_b = None  # DPB state for stream B (odd  frames)
+    # Per-stream reference state.  After an I-frame: ref.feature is None,
+    # ref.frame holds x_hat.  After a P-frame: ref.feature holds the decoder
+    # output feature, ref.frame is None.
+    ref_a = RefFrame()
+    ref_b = RefFrame()
 
-    # CUDA streams for concurrent GPU dispatch (one per interlaced stream)
-    if torch.cuda.is_available():
-        cuda_stream_a = torch.cuda.Stream(device)
-        cuda_stream_b = torch.cuda.Stream(device)
-    else:
-        cuda_stream_a = None
-        cuda_stream_b = None
-
-    # last_qp per stream (needed for reset_interval prepare_feature_adaptor_i)
+    # last QP per stream (needed for prepare_feature_adaptor_i)
     last_qp_a = 0
     last_qp_b = 0
 
-    # Index trackers within each sub-sequence (for reset_interval logic)
-    sub_idx_a = 0  # position of this frame within stream A
-    sub_idx_b = 0  # position of this frame within stream B
+    # Position of the current frame within each sub-sequence
+    sub_idx_a = 0
+    sub_idx_b = 0
 
     index_map = [0, 1, 0, 2, 0, 2, 0, 2]
 
-    def encode_one_stream(stream_idx, x_padded, sub_idx, state, last_qp, cuda_stream):
-        """
-        Encode a single frame for one interlaced stream.
-        Restores the given DPB state before encoding, then saves the updated state.
-        Returns (encoded, curr_qp, sps, is_i_frame, new_state, new_last_qp, new_sub_idx).
-        """
-        restore_dpb_state(p_frame_net, state)
+    def make_sps(use_ada_i):
+        return {
+            'sps_id': -1,
+            'height': pic_height,
+            'width': pic_width,
+            'ec_part': 1 if use_two_entropy_coders else 0,
+            'use_ada_i': use_ada_i,
+        }
 
-        is_i_frame = (sub_idx == 0)  # first frame of each stream is always an I-frame
-        if is_i_frame:
-            curr_qp = args['qp_i']
-            sps = {
-                'sps_id': -1,
-                'height': pic_height,
-                'width': pic_width,
-                'ec_part': 1 if use_two_entropy_coders else 0,
-                'use_ada_i': 0,
-            }
-            encoded = i_frame_net.compress(x_padded, args['qp_i'])
-            p_frame_net.clear_dpb()
-            p_frame_net.add_ref_frame(None, encoded['x_hat'])
-        else:
-            fa_idx = index_map[sub_idx % 8]
-            use_ada_i = 0
-            if reset_interval > 0 and sub_idx % reset_interval == 1:
-                use_ada_i = 1
-                p_frame_net.prepare_feature_adaptor_i(last_qp)
-            curr_qp = p_frame_net.shift_qp(args['qp_p'], fa_idx)
-            sps = {
-                'sps_id': -1,
-                'height': pic_height,
-                'width': pic_width,
-                'ec_part': 1 if use_two_entropy_coders else 0,
-                'use_ada_i': use_ada_i,
-            }
-            if cuda_stream is not None:
-                with torch.cuda.stream(cuda_stream):
-                    encoded = p_frame_net.compress(x_padded, curr_qp)
-            else:
-                encoded = p_frame_net.compress(x_padded, curr_qp)
-
-        new_state = save_dpb_state(p_frame_net)
-        return encoded, curr_qp, sps, is_i_frame, new_state, curr_qp, sub_idx + 1
-
-    # Initialise DPB states: both streams start empty (will get I-frames)
-    p_frame_net.clear_dpb()
-    state_a = save_dpb_state(p_frame_net)
-    state_b = save_dpb_state(p_frame_net)
-
-    # Process frames in pairs: (even_frame, odd_frame)
-    # If frame_num is odd the last pair has only one frame.
     pair_count = (frame_num + 1) // 2
 
     for pair_idx in range(pair_count):
-        even_orig_idx = pair_idx * 2        # original frame index for stream A
-        odd_orig_idx  = pair_idx * 2 + 1   # original frame index for stream B
+        even_orig_idx = pair_idx * 2
+        odd_orig_idx  = pair_idx * 2 + 1
 
         x_even, _, _, _, _ = frames[even_orig_idx]
         x_even_padded = replicate_pad(x_even, padding_b, padding_r)
@@ -283,28 +253,110 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             x_odd, _, _, _, _ = frames[odd_orig_idx]
             x_odd_padded = replicate_pad(x_odd, padding_b, padding_r)
 
-        torch.cuda.synchronize(device=device) if torch.cuda.is_available() else None
-        pair_start = time.time()
-
-        # --- Encode stream A (even frame) ---
-        enc_a, qp_a, sps_a, is_i_a, state_a, last_qp_a, sub_idx_a = \
-            encode_one_stream(0, x_even_padded, sub_idx_a, state_a, last_qp_a, cuda_stream_a)
-
-        # --- Encode stream B (odd frame) concurrently ---
-        if has_odd:
-            enc_b, qp_b, sps_b, is_i_b, state_b, last_qp_b, sub_idx_b = \
-                encode_one_stream(1, x_odd_padded, sub_idx_b, state_b, last_qp_b, cuda_stream_b)
-
-        # Wait for both GPU streams to finish
         if torch.cuda.is_available():
             torch.cuda.synchronize(device=device)
+        pair_start = time.time()
 
+        is_i_a = (sub_idx_a == 0)
+        is_i_b = (sub_idx_b == 0)
+        # Initialised here; only read when has_odd is True (all branches set them then)
+        bit_stream_b = b''
+        qp_b = 0
+        sps_b = make_sps(0)
+
+        if is_i_a:
+            # ---------------------------------------------------------------
+            # I-frame pair — encode sequentially, not batchable
+            # ---------------------------------------------------------------
+            qp_a = args['qp_i']
+            sps_a = make_sps(0)
+            enc_a = i_frame_net.compress(x_even_padded, qp_a)
+            ref_a.frame = enc_a['x_hat']
+            ref_a.feature = None
+            bit_stream_a = enc_a['bit_stream']
+
+            if has_odd:
+                qp_b = args['qp_i']
+                sps_b = make_sps(0)
+                enc_b = i_frame_net.compress(x_odd_padded, qp_b)
+                ref_b.frame = enc_b['x_hat']
+                ref_b.feature = None
+                bit_stream_b = enc_b['bit_stream']
+
+        elif has_odd:
+            # ---------------------------------------------------------------
+            # P-frame pair — batched B=2 forward + parallel entropy coding
+            # sub_idx_a == sub_idx_b always (lockstep), so fa_idx and qp match
+            # ---------------------------------------------------------------
+            fa_idx = index_map[sub_idx_a % 8]
+            use_ada_i = 0
+
+            if reset_interval > 0 and sub_idx_a % reset_interval == 1:
+                # prepare_feature_adaptor_i must run per-stream before the
+                # batched forward: it reconstructs x_hat from the stored feature
+                # (calls recon_generation_net) then nulls ref.feature.
+                use_ada_i = 1
+                for ref, last_qp in ((ref_a, last_qp_a), (ref_b, last_qp_b)):
+                    p_frame_net.clear_dpb()
+                    p_frame_net.add_ref_frame(ref.feature, ref.frame)
+                    p_frame_net.prepare_feature_adaptor_i(last_qp)
+                    ref.frame = p_frame_net.dpb[0].frame
+                    ref.feature = p_frame_net.dpb[0].feature
+
+            curr_qp = p_frame_net.shift_qp(args['qp_p'], fa_idx)
+            sps_a = sps_b = make_sps(use_ada_i)
+            qp_a = qp_b = curr_qp
+
+            mat_a = materialise_feature(p_frame_net, ref_a)
+            mat_b = materialise_feature(p_frame_net, ref_b)
+
+            x_batch = torch.cat((x_even_padded, x_odd_padded), dim=0)
+            bit_stream_a, bit_stream_b, feat_a, feat_b = \
+                p_frame_net.compress_batch(x_batch, curr_qp, mat_a, mat_b,
+                                           use_two_entropy_coders)
+
+            ref_a.feature = feat_a
+            ref_a.frame = None
+            ref_b.feature = feat_b
+            ref_b.frame = None
+            last_qp_a = last_qp_b = curr_qp
+
+        else:
+            # ---------------------------------------------------------------
+            # Last frame of an odd-length video — single P-frame, no batch
+            # ---------------------------------------------------------------
+            fa_idx = index_map[sub_idx_a % 8]
+            use_ada_i = 0
+
+            if reset_interval > 0 and sub_idx_a % reset_interval == 1:
+                use_ada_i = 1
+                p_frame_net.clear_dpb()
+                p_frame_net.add_ref_frame(ref_a.feature, ref_a.frame)
+                p_frame_net.prepare_feature_adaptor_i(last_qp_a)
+                ref_a.frame = p_frame_net.dpb[0].frame
+                ref_a.feature = p_frame_net.dpb[0].feature
+
+            curr_qp = p_frame_net.shift_qp(args['qp_p'], fa_idx)
+            sps_a = make_sps(use_ada_i)
+            qp_a = curr_qp
+
+            p_frame_net.clear_dpb()
+            p_frame_net.add_ref_frame(ref_a.feature, ref_a.frame)
+            enc_a = p_frame_net.compress(x_even_padded, curr_qp)
+            ref_a.feature = p_frame_net.dpb[0].feature
+            ref_a.frame = None
+            last_qp_a = curr_qp
+            bit_stream_a = enc_a['bit_stream']
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=device)
         pair_end = time.time()
         pair_time = pair_end - pair_start
-
-        # Each frame in the pair gets half the pair time as its individual time.
-        # This reflects that they ran (ideally) in parallel.
         per_frame_time = pair_time / (2 if has_odd else 1)
+
+        sub_idx_a += 1
+        if has_odd:
+            sub_idx_b += 1
 
         # --- Write stream A frame to bitstream ---
         sps_id_a, sps_new_a = sps_helper.get_sps_id(sps_a)
@@ -312,7 +364,7 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
         sps_bytes_a = 0
         if sps_new_a:
             sps_bytes_a = write_sps(output_buff, sps_a)
-        stream_bytes_a = write_ip(output_buff, is_i_a, sps_id_a, qp_a, enc_a['bit_stream'])
+        stream_bytes_a = write_ip(output_buff, is_i_a, sps_id_a, qp_a, bit_stream_a)
         bits[even_orig_idx] = stream_bytes_a * 8 + sps_bytes_a * 8
         frame_types[even_orig_idx] = 0 if is_i_a else 1
         encoding_times[even_orig_idx] = per_frame_time
@@ -328,7 +380,7 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             sps_bytes_b = 0
             if sps_new_b:
                 sps_bytes_b = write_sps(output_buff, sps_b)
-            stream_bytes_b = write_ip(output_buff, is_i_b, sps_id_b, qp_b, enc_b['bit_stream'])
+            stream_bytes_b = write_ip(output_buff, is_i_b, sps_id_b, qp_b, bit_stream_b)
             bits[odd_orig_idx] = stream_bytes_b * 8 + sps_bytes_b * 8
             frame_types[odd_orig_idx] = 0 if is_i_b else 1
             encoding_times[odd_orig_idx] = per_frame_time
