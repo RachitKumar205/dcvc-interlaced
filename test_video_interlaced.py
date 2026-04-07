@@ -309,9 +309,9 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             qp_a = qp_b = curr_qp
 
             x_batch = torch.cat((x_even_padded, x_odd_padded), dim=0)
+            pending = p_frame_net.compress_batch_async(x_batch, curr_qp, ref_a, ref_b)
             bit_stream_a, bit_stream_b, feat_a, feat_b = \
-                p_frame_net.compress_batch(x_batch, curr_qp, ref_a, ref_b,
-                                           use_two_entropy_coders)
+                p_frame_net.compress_batch_collect(pending)
 
             ref_a.feature = feat_a
             ref_a.frame = None
