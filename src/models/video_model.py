@@ -340,7 +340,7 @@ class DMC(CompressionModel):
             'bit_stream': bit_stream,
         }
 
-    def compress_batch(self, x, qp, ref_feature_a, ref_feature_b, use_two_entropy_coders):
+    def compress_batch(self, x, qp, ref_a, ref_b, use_two_entropy_coders):
         """
         Encode a pair of P-frames with a single B=2 GPU forward pass. Mirrors the
         CUDA-stream / event overlap structure of compress() so that the D->H
@@ -348,6 +348,9 @@ class DMC(CompressionModel):
         in-progress GPU decoder pass. Two long-lived per-stream EntropyCoders
         (self.entropy_coder, self.entropy_coder_b) are used so the two output
         bitstreams stay separate. No Python threading.
+
+        ref_a and ref_b are RefFrame objects; feature materialisation happens
+        inside this method (same as apply_feature_adaptor() in compress()).
 
         Returns (bit_stream_a, bit_stream_b, feature_a, feature_b).
         """
@@ -359,8 +362,12 @@ class DMC(CompressionModel):
         q_feature = self.q_feature[qp:qp+1, :, :, :]
 
         # --- B=2 GPU forward ---
-        # Ref features already passed through feature_adaptor_* by the caller.
-        feature = torch.cat((ref_feature_a, ref_feature_b), dim=0)  # [2, g_ch_d, H', W']
+        # Materialise reference features, mirroring apply_feature_adaptor() for each stream.
+        feat_a = (self.feature_adaptor_p(ref_a.feature) if ref_a.feature is not None
+                  else self.feature_adaptor_i(F.pixel_unshuffle(ref_a.frame, 8)))
+        feat_b = (self.feature_adaptor_p(ref_b.feature) if ref_b.feature is not None
+                  else self.feature_adaptor_i(F.pixel_unshuffle(ref_b.frame, 8)))
+        feature = torch.cat((feat_a, feat_b), dim=0)  # [2, g_ch_d, H', W']
 
         ctx, ctx_t = self.feature_extractor(feature, q_feature)
         y = self.encoder(x, ctx, q_encoder)

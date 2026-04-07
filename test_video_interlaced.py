@@ -307,12 +307,9 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             sps_a = sps_b = make_sps(use_ada_i)
             qp_a = qp_b = curr_qp
 
-            mat_a = materialise_feature(p_frame_net, ref_a)
-            mat_b = materialise_feature(p_frame_net, ref_b)
-
             x_batch = torch.cat((x_even_padded, x_odd_padded), dim=0)
             bit_stream_a, bit_stream_b, feat_a, feat_b = \
-                p_frame_net.compress_batch(x_batch, curr_qp, mat_a, mat_b,
+                p_frame_net.compress_batch(x_batch, curr_qp, ref_a, ref_b,
                                            use_two_entropy_coders)
 
             ref_a.feature = feat_a
