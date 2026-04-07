@@ -1,14 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import threading
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from .common_model import CompressionModel
-from .entropy_models import EntropyCoder
 from ..layers.layers import SubpelConv2x, DepthConvBlock, \
     ResidualBlockUpsample, ResidualBlockWithStride2
 from ..layers.cuda_inference import CUSTOMIZED_CUDA_INFERENCE, round_and_to_int8, \
@@ -345,15 +342,14 @@ class DMC(CompressionModel):
 
     def compress_batch(self, x, qp, ref_feature_a, ref_feature_b, use_two_entropy_coders):
         """
-        Encode a pair of P-frames with a single B=2 GPU forward pass followed by
-        parallel CPU entropy coding on two threads.
-
-        ref_feature_a and ref_feature_b must be already-materialised [1, g_ch_d, H', W']
-        tensors produced by the caller via materialise_feature().
+        Encode a pair of P-frames with a single B=2 GPU forward pass. Mirrors the
+        CUDA-stream / event overlap structure of compress() so that the D->H
+        symbol transfers and the C++ entropy encode run concurrently with the
+        in-progress GPU decoder pass. Two long-lived per-stream EntropyCoders
+        (self.entropy_coder, self.entropy_coder_b) are used so the two output
+        bitstreams stay separate. No Python threading.
 
         Returns (bit_stream_a, bit_stream_b, feature_a, feature_b).
-        feature_a/b are [1, g_ch_d, H', W'] and should be stored back into the
-        caller's per-stream RefFrame.feature.
         """
         assert x.shape[0] == 2
         device = x.device
@@ -362,72 +358,72 @@ class DMC(CompressionModel):
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
         q_feature = self.q_feature[qp:qp+1, :, :, :]
 
-        # --- Phase 1: B=2 GPU forward ---
-        # Both ref features have already been run through feature_adaptor_* by the caller,
-        # matching exactly what compress() does via apply_feature_adaptor().
+        # --- B=2 GPU forward ---
+        # Ref features already passed through feature_adaptor_* by the caller.
         feature = torch.cat((ref_feature_a, ref_feature_b), dim=0)  # [2, g_ch_d, H', W']
 
         ctx, ctx_t = self.feature_extractor(feature, q_feature)
         y = self.encoder(x, ctx, q_encoder)
+
         z = self.hyper_encoder(self.pad_for_y(y))
         z_hat, z_hat_write = round_and_to_int8(z)
+        cuda_event_z_ready = torch.cuda.Event()
+        cuda_event_z_ready.record()
+
         params = self.res_prior_param_decoder(z_hat, ctx_t)
         y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
             self.compress_prior_2x(y, params, self.y_spatial_prior)
+
+        cuda_event_y_ready = torch.cuda.Event()
+        cuda_event_y_ready.record()
+
+        # Long-running GPU job left on the default stream so the entropy work on
+        # the priority stream below can overlap it.
         feature = self.decoder(y_hat, ctx, q_decoder)   # [2, g_ch_d, H', W']
 
-        torch.cuda.synchronize(device=device)
+        # Per-frame slices are views over the [2, ...] tensors; the underlying
+        # encode_z / encode_y kernels handle the slice efficiently.
+        z_a = z_hat_write[0:1]; z_b = z_hat_write[1:2]
+        y0a = y_q_w_0[0:1];     y0b = y_q_w_0[1:2]
+        y1a = y_q_w_1[0:1];     y1b = y_q_w_1[1:2]
+        s0a = s_w_0[0:1];       s0b = s_w_0[1:2]
+        s1a = s_w_1[0:1];       s1b = s_w_1[1:2]
 
+        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+        with torch.cuda.stream(cuda_stream):
+            # Stream A
+            self.select_entropy_coder(self.entropy_coder)
+            self.entropy_coder.reset()
+            cuda_event_z_ready.wait()
+            self.bit_estimator_z.encode_z(z_a, qp)
+            cuda_event_y_ready.wait()
+            self.gaussian_encoder.encode_y(y0a, s0a)
+            self.gaussian_encoder.encode_y(y1a, s1a)
+            self.entropy_coder.flush()
+
+            # Stream B
+            self.select_entropy_coder(self.entropy_coder_b)
+            self.entropy_coder_b.reset()
+            self.bit_estimator_z.encode_z(z_b, qp)
+            self.gaussian_encoder.encode_y(y0b, s0b)
+            self.gaussian_encoder.encode_y(y1b, s1b)
+            self.entropy_coder_b.flush()
+
+        # Both flush() calls returned immediately; the four C++ workers (two per
+        # coder when use_two_entropy_coders=True) are now running in parallel
+        # alongside the GPU decoder pass. get_encoded_stream() blocks until each
+        # coder's worker signals done.
+        bit_stream_a = self.entropy_coder.get_encoded_stream()
+        bit_stream_b = self.entropy_coder_b.get_encoded_stream()
+
+        # Restore the primary coder as the active one for any subsequent
+        # non-batched compress() calls.
+        self.select_entropy_coder(self.entropy_coder)
+
+        torch.cuda.synchronize(device=device)
         feature_a = feature[0:1]
         feature_b = feature[1:2]
-
-        # --- Phase 2: pre-compute entropy inputs on main thread ---
-        # build_indexes_encoder flattens to 1D, so compute per frame slice separately
-        # before threading to avoid interleaved symbol streams.
-        # All tensors are moved to CPU here so threads never touch the CUDA context.
-        _, _, Hz, Wz = z_hat_write.shape
-        z_t_a = z_hat_write[0:1].reshape(-1).cpu()   # tensor, EntropyCoder.encode_z does .to(int8)
-        z_t_b = z_hat_write[1:2].reshape(-1).cpu()
-
-        sym_y0_a = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_0[0:1], s_w_0[0:1]).cpu()           # int16 tensor
-        sym_y0_b = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_0[1:2], s_w_0[1:2]).cpu()
-        sym_y1_a = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_1[0:1], s_w_1[0:1]).cpu()
-        sym_y1_b = self.gaussian_encoder.build_indexes_encoder(
-            y_q_w_1[1:2], s_w_1[1:2]).cpu()
-
-        z_channel = self.bit_estimator_z.channel
-        cdf_info_z = self.bit_estimator_z.get_cdf_info()
-        cdf_info_y = self.gaussian_encoder.get_cdf_info()
-
-        # --- Phase 3: parallel entropy coding on two threads ---
-        # Each thread gets its own fresh EntropyCoder with CDFs registered in the
-        # same order (bit_estimator_z first, gaussian_encoder second), matching the
-        # cdf_group_index values used when pre-computing the symbols above.
-        results = [None, None]
-
-        def _encode(idx, z_t, sym_y0, sym_y1):
-            coder = EntropyCoder()
-            coder.set_use_two_entropy_coders(use_two_entropy_coders)
-            cdf_idx_z = coder.add_cdf(*cdf_info_z)
-            cdf_idx_y = coder.add_cdf(*cdf_info_y)
-            coder.reset()
-            coder.encode_z(z_t, cdf_idx_z, qp * z_channel, Hz * Wz)
-            coder.encode_y(sym_y0, cdf_idx_y)
-            coder.encode_y(sym_y1, cdf_idx_y)
-            coder.flush()
-            results[idx] = coder.get_encoded_stream()
-
-        t_a = threading.Thread(target=_encode, args=(0, z_t_a, sym_y0_a, sym_y1_a))
-        t_b = threading.Thread(target=_encode, args=(1, z_t_b, sym_y0_b, sym_y1_b))
-        t_a.start()
-        t_b.start()
-        t_a.join()
-        t_b.join()
-
-        return results[0], results[1], feature_a, feature_b
+        return bit_stream_a, bit_stream_b, feature_a, feature_b
 
     def decompress(self, bit_stream, sps, qp):
         dtype = next(self.parameters()).dtype

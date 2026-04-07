@@ -16,6 +16,7 @@ class CompressionModel(nn.Module):
 
         self.z_channel = z_channel
         self.entropy_coder = None
+        self.entropy_coder_b = None
         self.bit_estimator_z = BitEstimator(64 + extra_qp, z_channel)
         self.gaussian_encoder = GaussianEncoder()
 
@@ -51,8 +52,26 @@ class CompressionModel(nn.Module):
         self.gaussian_encoder.update(self.entropy_coder, force_zero_thres=force_zero_thres)
         self.bit_estimator_z.update(self.entropy_coder)
 
+        # Long-lived second coder for batched/interlaced encoding (stream B). CDFs
+        # are registered in the same order as on the primary coder so that the
+        # cdf_group_index values stored on bit_estimator_z / gaussian_encoder are
+        # valid against either coder. compress_batch() swaps which coder the
+        # submodules dispatch to via select_entropy_coder().
+        self.entropy_coder_b = EntropyCoder()
+        idx_y_b = self.entropy_coder_b.add_cdf(*self.gaussian_encoder.get_cdf_info())
+        idx_z_b = self.entropy_coder_b.add_cdf(*self.bit_estimator_z.get_cdf_info())
+        assert idx_y_b == self.gaussian_encoder.cdf_group_index
+        assert idx_z_b == self.bit_estimator_z.cdf_group_index
+
     def set_use_two_entropy_coders(self, use_two_entropy_coders):
         self.entropy_coder.set_use_two_entropy_coders(use_two_entropy_coders)
+        self.entropy_coder_b.set_use_two_entropy_coders(use_two_entropy_coders)
+
+    def select_entropy_coder(self, coder):
+        """Point bit_estimator_z and gaussian_encoder at the given coder so that
+        their encode_z / encode_y calls dispatch through it."""
+        self.bit_estimator_z.entropy_coder = coder
+        self.gaussian_encoder.entropy_coder = coder
 
     def pad_for_y(self, y):
         _, _, H, W = y.size()
