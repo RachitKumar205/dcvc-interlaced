@@ -246,16 +246,17 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
         odd_orig_idx  = pair_idx * 2 + 1
 
         x_even, _, _, _, _ = frames[even_orig_idx]
-        x_even_padded = replicate_pad(x_even, padding_b, padding_r)
-
         has_odd = (odd_orig_idx < frame_num)
         if has_odd:
             x_odd, _, _, _, _ = frames[odd_orig_idx]
-            x_odd_padded = replicate_pad(x_odd, padding_b, padding_r)
 
         if torch.cuda.is_available():
             torch.cuda.synchronize(device=device)
         pair_start = time.time()
+
+        x_even_padded = replicate_pad(x_even, padding_b, padding_r)
+        if has_odd:
+            x_odd_padded = replicate_pad(x_odd, padding_b, padding_r)
 
         is_i_a = (sub_idx_a == 0)
         is_i_b = (sub_idx_b == 0)
@@ -345,16 +346,6 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             last_qp_a = curr_qp
             bit_stream_a = enc_a['bit_stream']
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(device=device)
-        pair_end = time.time()
-        pair_time = pair_end - pair_start
-        per_frame_time = pair_time / (2 if has_odd else 1)
-
-        sub_idx_a += 1
-        if has_odd:
-            sub_idx_b += 1
-
         # --- Write stream A frame to bitstream ---
         sps_id_a, sps_new_a = sps_helper.get_sps_id(sps_a)
         sps_a['sps_id'] = sps_id_a
@@ -364,11 +355,6 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
         stream_bytes_a = write_ip(output_buff, is_i_a, sps_id_a, qp_a, bit_stream_a)
         bits[even_orig_idx] = stream_bytes_a * 8 + sps_bytes_a * 8
         frame_types[even_orig_idx] = 0 if is_i_a else 1
-        encoding_times[even_orig_idx] = per_frame_time
-
-        if verbose >= 2:
-            print(f"frame {even_orig_idx} (stream A) encoded, {per_frame_time*1000:.3f} ms, "
-                  f"bits: {bits[even_orig_idx]}")
 
         # --- Write stream B frame to bitstream ---
         if has_odd:
@@ -380,8 +366,24 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             stream_bytes_b = write_ip(output_buff, is_i_b, sps_id_b, qp_b, bit_stream_b)
             bits[odd_orig_idx] = stream_bytes_b * 8 + sps_bytes_b * 8
             frame_types[odd_orig_idx] = 0 if is_i_b else 1
-            encoding_times[odd_orig_idx] = per_frame_time
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=device)
+        pair_end = time.time()
+        pair_time = pair_end - pair_start
+        per_frame_time = pair_time / (2 if has_odd else 1)
+
+        sub_idx_a += 1
+        if has_odd:
+            sub_idx_b += 1
+
+        encoding_times[even_orig_idx] = per_frame_time
+        if verbose >= 2:
+            print(f"frame {even_orig_idx} (stream A) encoded, {per_frame_time*1000:.3f} ms, "
+                  f"bits: {bits[even_orig_idx]}")
+
+        if has_odd:
+            encoding_times[odd_orig_idx] = per_frame_time
             if verbose >= 2:
                 print(f"frame {odd_orig_idx} (stream B) encoded, {per_frame_time*1000:.3f} ms, "
                       f"bits: {bits[odd_orig_idx]}")
