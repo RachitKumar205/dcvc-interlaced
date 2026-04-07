@@ -545,6 +545,7 @@ def run_one_batch(p_frame_net, i_frame_net, seq_args_list):
             frames_src.append(get_src_frame(a, src_reader, next(p_frame_net.parameters()).device))
         src_reader.close()
 
+        p_frame_net.clear_dpb()
         p_frame_net.set_curr_poc(0)
         with open(a['curr_bin_path'], 'rb') as f:
             input_buff = io.BytesIO(f.read())
