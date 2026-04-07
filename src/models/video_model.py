@@ -340,6 +340,68 @@ class DMC(CompressionModel):
             'bit_stream': bit_stream,
         }
 
+    def compress_batch(self, x_batch, qp, ref_features):
+        """
+        Encode N independent frames in a single B=N GPU forward pass, then
+        encode each sequence's symbols sequentially with the shared entropy coder.
+
+        All N sequences must have the same resolution and the same QP (the
+        caller is responsible for ensuring this).
+
+        Args:
+            x_batch:     [N, 3, H, W]       -- N input frames, already padded
+            qp:          int                 -- QP, same for all sequences
+            ref_features:[N, g_ch_d, H', W'] -- pre-materialised reference
+                         features, one per sequence (see materialise_feature()
+                         in the test script).
+
+        Returns:
+            bit_streams  -- list of N bytes objects, one bitstream per sequence
+            features_out -- [N, g_ch_d, H', W'] new decoder features; caller
+                           stores features_out[i:i+1] back into its per-sequence
+                           RefFrame.
+        """
+        assert x_batch.shape[0] == ref_features.shape[0], \
+            "x_batch and ref_features must have the same batch dimension"
+        N = x_batch.shape[0]
+        device = x_batch.device
+
+        # q-tables are [1, C, 1, 1]; they broadcast correctly over batch dim N.
+        q_encoder = self.q_encoder[qp:qp+1, :, :, :]
+        q_decoder = self.q_decoder[qp:qp+1, :, :, :]
+        q_feature = self.q_feature[qp:qp+1, :, :, :]
+
+        # ------------------------------------------------------------------
+        # Phase 1: B=N GPU forward pass
+        # ------------------------------------------------------------------
+        ctx, ctx_t = self.feature_extractor(ref_features, q_feature)
+        y = self.encoder(x_batch, ctx, q_encoder)
+
+        z = self.hyper_encoder(self.pad_for_y(y))
+        z_hat, z_hat_write = round_and_to_int8(z)
+        params = self.res_prior_param_decoder(z_hat, ctx_t)
+        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+            self.compress_prior_2x(y, params, self.y_spatial_prior)
+        features_out = self.decoder(y_hat, ctx, q_decoder)   # [N, g_ch_d, H', W']
+
+        # Wait for all GPU work to finish before touching results on the CPU.
+        torch.cuda.synchronize(device=device)
+
+        # ------------------------------------------------------------------
+        # Phase 2: per-sequence entropy coding (sequential, reusing the
+        # shared entropy coder — reset() clears symbols but keeps CDFs).
+        # ------------------------------------------------------------------
+        bit_streams = []
+        for i in range(N):
+            self.entropy_coder.reset()
+            self.bit_estimator_z.encode_z(z_hat_write[i:i+1], qp)
+            self.gaussian_encoder.encode_y(y_q_w_0[i:i+1], s_w_0[i:i+1])
+            self.gaussian_encoder.encode_y(y_q_w_1[i:i+1], s_w_1[i:i+1])
+            self.entropy_coder.flush()
+            bit_streams.append(self.entropy_coder.get_encoded_stream())
+
+        return bit_streams, features_out
+
     def decompress(self, bit_stream, sps, qp):
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
