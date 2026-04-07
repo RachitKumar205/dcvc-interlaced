@@ -183,6 +183,57 @@ def materialise_feature(p_frame_net, ref_frame):
 
 
 # ---------------------------------------------------------------------------
+# Pipeline helpers
+# ---------------------------------------------------------------------------
+
+def _write_pair(bit_stream_a, bit_stream_b, is_i_a, is_i_b,
+                qp_a, qp_b, sps_a, sps_b, has_odd,
+                even_orig_idx, odd_orig_idx,
+                bits, frame_types, sps_helper, output_buff):
+    sps_id_a, sps_new_a = sps_helper.get_sps_id(sps_a)
+    sps_a['sps_id'] = sps_id_a
+    sps_bytes_a = write_sps(output_buff, sps_a) if sps_new_a else 0
+    stream_bytes_a = write_ip(output_buff, is_i_a, sps_id_a, qp_a, bit_stream_a)
+    bits[even_orig_idx] = (stream_bytes_a + sps_bytes_a) * 8
+    frame_types[even_orig_idx] = 0 if is_i_a else 1
+    if has_odd:
+        sps_id_b, sps_new_b = sps_helper.get_sps_id(sps_b)
+        sps_b['sps_id'] = sps_id_b
+        sps_bytes_b = write_sps(output_buff, sps_b) if sps_new_b else 0
+        stream_bytes_b = write_ip(output_buff, is_i_b, sps_id_b, qp_b, bit_stream_b)
+        bits[odd_orig_idx] = (stream_bytes_b + sps_bytes_b) * 8
+        frame_types[odd_orig_idx] = 0 if is_i_b else 1
+
+
+def _record_time(pair_time, has_odd, even_orig_idx, odd_orig_idx, encoding_times, bits, verbose):
+    per_frame_time = pair_time / (2 if has_odd else 1)
+    encoding_times[even_orig_idx] = per_frame_time
+    if has_odd:
+        encoding_times[odd_orig_idx] = per_frame_time
+    if verbose >= 2:
+        n = 2 if has_odd else 1
+        print(f"  pair [{even_orig_idx},{odd_orig_idx if has_odd else '-'}] "
+              f"{pair_time*1000:.1f} ms total, {per_frame_time*1000:.1f} ms/frame")
+
+
+def _collect_and_write(p_frame_net, pending_p, pending_meta,
+                       bits, frame_types, encoding_times,
+                       sps_helper, output_buff, verbose):
+    """Block on entropy workers, sync GPU, write bitstreams, record timing."""
+    bit_stream_a, bit_stream_b, feat_a, feat_b = \
+        p_frame_net.compress_batch_collect(pending_p)
+    m = pending_meta
+    _write_pair(bit_stream_a, bit_stream_b, m['is_i_a'], m['is_i_b'],
+                m['qp_a'], m['qp_b'], m['sps_a'], m['sps_b'], m['has_odd'],
+                m['even_orig_idx'], m['odd_orig_idx'],
+                bits, frame_types, sps_helper, output_buff)
+    pair_time = time.time() - m['pair_start']
+    _record_time(pair_time, m['has_odd'], m['even_orig_idx'], m['odd_orig_idx'],
+                 encoding_times, bits, verbose)
+    return feat_a, feat_b
+
+
+# ---------------------------------------------------------------------------
 # Interlaced encode
 # ---------------------------------------------------------------------------
 
@@ -241,6 +292,19 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
 
     pair_count = (frame_num + 1) // 2
 
+    # Pipeline state: after compress_batch_async() returns, we immediately use
+    # the (still-in-flight) GPU feature tensor as the next pair's reference.
+    # PyTorch enforces the GPU-side ordering automatically because all GPU ops
+    # go to the default stream — the next pair's GPU forward queues behind the
+    # current pair's decoder. Meanwhile collect() blocks on the CPU entropy
+    # workers, which overlap with that next-pair GPU forward.
+    #
+    # pending_p: the async pending dict for the previous P-frame pair, to be
+    #            collected at the start of the next iteration (or after the loop).
+    # pending_meta: sps/qp/idx metadata needed to write the bitstream after collect.
+    pending_p = None
+    pending_meta = None
+
     for pair_idx in range(pair_count):
         even_orig_idx = pair_idx * 2
         odd_orig_idx  = pair_idx * 2 + 1
@@ -250,7 +314,10 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
         if has_odd:
             x_odd, _, _, _, _ = frames[odd_orig_idx]
 
-        if torch.cuda.is_available():
+        # Start timing. For pipelined P-pairs, the sync is replaced by the
+        # GPU-side event ordering — but we still sync here to get a meaningful
+        # wall-clock number for I-frames and the last odd frame.
+        if torch.cuda.is_available() and (pending_p is None):
             torch.cuda.synchronize(device=device)
         pair_start = time.time()
 
@@ -260,15 +327,22 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
 
         is_i_a = (sub_idx_a == 0)
         is_i_b = (sub_idx_b == 0)
-        # Initialised here; only read when has_odd is True (all branches set them then)
         bit_stream_b = b''
         qp_b = 0
         sps_b = make_sps(0)
 
         if is_i_a:
             # ---------------------------------------------------------------
-            # I-frame pair — encode sequentially, not batchable
+            # I-frame pair — encode sequentially (not batchable).
+            # If there's a pending P-pair from before, collect it first.
             # ---------------------------------------------------------------
+            if pending_p is not None:
+                _collect_and_write(p_frame_net, pending_p, pending_meta,
+                                   bits, frame_types, encoding_times, sps_helper,
+                                   output_buff, verbose)
+                pending_p = None
+                pending_meta = None
+
             qp_a = args['qp_i']
             sps_a = make_sps(0)
             enc_a = i_frame_net.compress(x_even_padded, qp_a)
@@ -284,18 +358,32 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
                 ref_b.feature = None
                 bit_stream_b = enc_b['bit_stream']
 
+            _write_pair(bit_stream_a, bit_stream_b, is_i_a, is_i_b,
+                        qp_a, qp_b, sps_a, sps_b, has_odd,
+                        even_orig_idx, odd_orig_idx,
+                        bits, frame_types, sps_helper, output_buff)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device=device)
+            pair_end = time.time()
+            _record_time(pair_end - pair_start, has_odd,
+                         even_orig_idx, odd_orig_idx, encoding_times, bits, verbose)
+
         elif has_odd:
             # ---------------------------------------------------------------
-            # P-frame pair — batched B=2 forward + parallel entropy coding
-            # sub_idx_a == sub_idx_b always (lockstep), so fa_idx and qp match
+            # P-frame pair — pipelined: async forward now, collect previous.
             # ---------------------------------------------------------------
             fa_idx = index_map[sub_idx_a % 8]
             use_ada_i = 0
 
             if reset_interval > 0 and sub_idx_a % reset_interval == 1:
-                # prepare_feature_adaptor_i must run per-stream before the
-                # batched forward: it reconstructs x_hat from the stored feature
-                # (calls recon_generation_net) then nulls ref.feature.
+                # Must collect any pending pair before mutating DPB.
+                if pending_p is not None:
+                    _collect_and_write(p_frame_net, pending_p, pending_meta,
+                                       bits, frame_types, encoding_times, sps_helper,
+                                       output_buff, verbose)
+                    pending_p = None
+                    pending_meta = None
                 use_ada_i = 1
                 for ref, last_qp in ((ref_a, last_qp_a), (ref_b, last_qp_b)):
                     p_frame_net.clear_dpb()
@@ -309,20 +397,50 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             qp_a = qp_b = curr_qp
 
             x_batch = torch.cat((x_even_padded, x_odd_padded), dim=0)
-            pending = p_frame_net.compress_batch_async(x_batch, curr_qp, ref_a, ref_b)
-            bit_stream_a, bit_stream_b, feat_a, feat_b = \
-                p_frame_net.compress_batch_collect(pending)
 
-            ref_a.feature = feat_a
+            # Launch this pair's GPU forward. Pass the previous decoder event
+            # so PyTorch inserts a GPU-side wait before our GPU ops — no CPU sync.
+            prev_event = pending_p['decoder_event'] if pending_p is not None else None
+            new_pending = p_frame_net.compress_batch_async(
+                x_batch, curr_qp, ref_a, ref_b, prev_decoder_event=prev_event)
+
+            # Immediately use the (in-flight) GPU feature tensor as refs for the
+            # next pair. The GPU-side ordering ensures correctness.
+            ref_a.feature = new_pending['feature'][0:1]
             ref_a.frame = None
-            ref_b.feature = feat_b
+            ref_b.feature = new_pending['feature'][1:2]
             ref_b.frame = None
             last_qp_a = last_qp_b = curr_qp
 
+            # Now collect the PREVIOUS pair (its entropy workers have been running
+            # while we launched this pair's GPU forward above).
+            if pending_p is not None:
+                _collect_and_write(p_frame_net, pending_p, pending_meta,
+                                   bits, frame_types, encoding_times, sps_helper,
+                                   output_buff, verbose)
+
+            pending_p = new_pending
+            pending_meta = {
+                'sps_a': sps_a, 'sps_b': sps_b,
+                'qp_a': qp_a,   'qp_b': qp_b,
+                'is_i_a': is_i_a, 'is_i_b': is_i_b,
+                'has_odd': has_odd,
+                'even_orig_idx': even_orig_idx,
+                'odd_orig_idx': odd_orig_idx,
+                'pair_start': pair_start,
+            }
+
         else:
             # ---------------------------------------------------------------
-            # Last frame of an odd-length video — single P-frame, no batch
+            # Last frame of an odd-length video — single P-frame, no batch.
             # ---------------------------------------------------------------
+            if pending_p is not None:
+                _collect_and_write(p_frame_net, pending_p, pending_meta,
+                                   bits, frame_types, encoding_times, sps_helper,
+                                   output_buff, verbose)
+                pending_p = None
+                pending_meta = None
+
             fa_idx = index_map[sub_idx_a % 8]
             use_ada_i = 0
 
@@ -346,47 +464,26 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
             last_qp_a = curr_qp
             bit_stream_a = enc_a['bit_stream']
 
-        # --- Write stream A frame to bitstream ---
-        sps_id_a, sps_new_a = sps_helper.get_sps_id(sps_a)
-        sps_a['sps_id'] = sps_id_a
-        sps_bytes_a = 0
-        if sps_new_a:
-            sps_bytes_a = write_sps(output_buff, sps_a)
-        stream_bytes_a = write_ip(output_buff, is_i_a, sps_id_a, qp_a, bit_stream_a)
-        bits[even_orig_idx] = stream_bytes_a * 8 + sps_bytes_a * 8
-        frame_types[even_orig_idx] = 0 if is_i_a else 1
+            _write_pair(bit_stream_a, b'', is_i_a, False,
+                        qp_a, 0, sps_a, make_sps(0), False,
+                        even_orig_idx, odd_orig_idx,
+                        bits, frame_types, sps_helper, output_buff)
 
-        # --- Write stream B frame to bitstream ---
-        if has_odd:
-            sps_id_b, sps_new_b = sps_helper.get_sps_id(sps_b)
-            sps_b['sps_id'] = sps_id_b
-            sps_bytes_b = 0
-            if sps_new_b:
-                sps_bytes_b = write_sps(output_buff, sps_b)
-            stream_bytes_b = write_ip(output_buff, is_i_b, sps_id_b, qp_b, bit_stream_b)
-            bits[odd_orig_idx] = stream_bytes_b * 8 + sps_bytes_b * 8
-            frame_types[odd_orig_idx] = 0 if is_i_b else 1
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(device=device)
-        pair_end = time.time()
-        pair_time = pair_end - pair_start
-        per_frame_time = pair_time / (2 if has_odd else 1)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device=device)
+            pair_end = time.time()
+            _record_time(pair_end - pair_start, False,
+                         even_orig_idx, odd_orig_idx, encoding_times, bits, verbose)
 
         sub_idx_a += 1
         if has_odd:
             sub_idx_b += 1
 
-        encoding_times[even_orig_idx] = per_frame_time
-        if verbose >= 2:
-            print(f"frame {even_orig_idx} (stream A) encoded, {per_frame_time*1000:.3f} ms, "
-                  f"bits: {bits[even_orig_idx]}")
-
-        if has_odd:
-            encoding_times[odd_orig_idx] = per_frame_time
-            if verbose >= 2:
-                print(f"frame {odd_orig_idx} (stream B) encoded, {per_frame_time*1000:.3f} ms, "
-                      f"bits: {bits[odd_orig_idx]}")
+    # Collect the last pending P-pair.
+    if pending_p is not None:
+        _collect_and_write(p_frame_net, pending_p, pending_meta,
+                           bits, frame_types, encoding_times, sps_helper,
+                           output_buff, verbose)
 
     return frame_types, bits, encoding_times
 

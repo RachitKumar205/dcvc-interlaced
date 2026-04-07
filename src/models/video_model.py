@@ -340,19 +340,23 @@ class DMC(CompressionModel):
             'bit_stream': bit_stream,
         }
 
-    def compress_batch_async(self, x, qp, ref_a, ref_b):
+    def compress_batch_async(self, x, qp, ref_a, ref_b, prev_decoder_event=None):
         """
-        Phase 1 of pipelined pair encoding. Runs the full B=2 GPU forward pass,
-        queues entropy for both streams on the priority CUDA stream, and returns
-        immediately WITHOUT blocking on get_encoded_stream(). The C++ RANS
-        workers start running as soon as flush() is called.
+        Phase 1 of pipelined pair encoding.
 
-        The caller must call compress_batch_collect() on the returned pending
-        dict before encoding the pair AFTER next (to give the workers time to
-        finish while the next GPU forward runs).
+        If prev_decoder_event is not None (all pairs after the first), the GPU
+        work on the default stream waits for that event before starting, so this
+        pair's GPU forward begins as soon as the previous pair's decoder is done
+        on the GPU — without a CPU-side synchronize. This allows the previous
+        pair's entropy workers (running on CPU) to overlap with this pair's GPU
+        forward.
 
-        Returns pending dict with feature_a, feature_b, and enough state for
-        compress_batch_collect() to retrieve the bitstreams.
+        Queues entropy for both streams on separate priority CUDA streams (so
+        their D->H transfers run in parallel), calls flush() on both (returns
+        immediately — C++ workers start), then returns a pending dict WITHOUT
+        blocking on get_encoded_stream().
+
+        Returns pending dict; caller must pass it to compress_batch_collect().
         """
         assert x.shape[0] == 2
         device = x.device
@@ -360,6 +364,11 @@ class DMC(CompressionModel):
         q_encoder = self.q_encoder[qp:qp+1, :, :, :]
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
         q_feature = self.q_feature[qp:qp+1, :, :, :]
+
+        # If a previous decoder event was provided, wait for it on the default
+        # stream before issuing any GPU work so PyTorch sees the ordering.
+        if prev_decoder_event is not None:
+            prev_decoder_event.wait()   # no-op on CPU; inserts wait into default stream
 
         # Materialise reference features, mirroring apply_feature_adaptor().
         feat_a = (self.feature_adaptor_p(ref_a.feature) if ref_a.feature is not None
@@ -383,11 +392,11 @@ class DMC(CompressionModel):
         cuda_event_y_ready = torch.cuda.Event()
         cuda_event_y_ready.record()
 
-        # Long-running GPU job on the default stream; entropy on the priority
-        # stream overlaps it, and the NEXT pair's GPU forward (also default
-        # stream) will queue behind it — giving the entropy workers time to
-        # finish while the next pair's GPU work runs.
+        # Decoder runs on the default stream. Record an event immediately after
+        # so the next pair can wait on it (GPU-side only) without a CPU sync.
         feature = self.decoder(y_hat, ctx, q_decoder)   # [2, g_ch_d, H', W']
+        cuda_event_decoder_done = torch.cuda.Event()
+        cuda_event_decoder_done.record()
 
         z_a = z_hat_write[0:1]; z_b = z_hat_write[1:2]
         y0a = y_q_w_0[0:1];     y0b = y_q_w_0[1:2]
@@ -395,8 +404,7 @@ class DMC(CompressionModel):
         s0a = s_w_0[0:1];       s0b = s_w_0[1:2]
         s1a = s_w_1[0:1];       s1b = s_w_1[1:2]
 
-        # Two separate priority streams so stream A and B entropy I/O
-        # (the D->H transfers inside encode_z/encode_y) can run in parallel.
+        # Two separate priority CUDA streams so A and B D->H transfers overlap.
         cuda_stream_a = self.get_cuda_stream(device=device, priority=-1, idx=0)
         cuda_stream_b = self.get_cuda_stream(device=device, priority=-1, idx=1)
 
@@ -420,23 +428,27 @@ class DMC(CompressionModel):
             self.gaussian_encoder.encode_y(y1b, s1b)
             self.entropy_coder_b.flush()
 
-        # Restore primary coder for any non-batched compress() calls.
         self.select_entropy_coder(self.entropy_coder)
 
-        # Return without blocking — C++ workers are already running.
+        # Return immediately — C++ entropy workers are running, GPU decoder may
+        # still be running. The caller starts the next pair's GPU forward (which
+        # will wait on cuda_event_decoder_done on the GPU side), then calls
+        # compress_batch_collect() which blocks on entropy + CPU sync.
         return {
-            'feature': feature,   # [2, g_ch_d, H', W'] still on GPU
+            'feature': feature,
             'device': device,
+            'decoder_event': cuda_event_decoder_done,
         }
 
     def compress_batch_collect(self, pending):
         """
-        Phase 2 of pipelined pair encoding. Blocks until the entropy workers
-        for the pair started by compress_batch_async() have finished, then
-        syncs the GPU and returns (bit_stream_a, bit_stream_b, feature_a, feature_b).
+        Phase 2 of pipelined pair encoding. Blocks on get_encoded_stream() for
+        both entropy coders (CPU wait on RANS workers), then does a single
+        cuda.synchronize() to ensure the decoder is done, and returns
+        (bit_stream_a, bit_stream_b, feature_a, feature_b).
 
-        Call this AFTER the next pair's compress_batch_async() has been issued,
-        so the blocking wait overlaps with the next GPU forward.
+        Call this AFTER the next pair's compress_batch_async() has been issued
+        so that collect's blocking wait overlaps the next GPU forward.
         """
         bit_stream_a = self.entropy_coder.get_encoded_stream()
         bit_stream_b = self.entropy_coder_b.get_encoded_stream()
