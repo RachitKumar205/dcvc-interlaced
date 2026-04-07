@@ -371,6 +371,8 @@ class DMC(CompressionModel):
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
         q_feature = self.q_feature[qp:qp+1, :, :, :]
 
+        import time
+        t_gpu_start = time.time()
         # ------------------------------------------------------------------
         # Phase 1: B=N GPU forward pass
         # ------------------------------------------------------------------
@@ -386,7 +388,9 @@ class DMC(CompressionModel):
 
         # Wait for all GPU work to finish before touching results on the CPU.
         torch.cuda.synchronize(device=device)
+        t_gpu_end = time.time()
 
+        t_cpu_start = time.time()
         # ------------------------------------------------------------------
         # Phase 2: per-sequence entropy coding (sequential, reusing the
         # shared entropy coder — reset() clears symbols but keeps CDFs).
@@ -400,7 +404,13 @@ class DMC(CompressionModel):
             self.entropy_coder.flush()
             bit_streams.append(self.entropy_coder.get_encoded_stream())
 
-        return bit_streams, features_out
+        t_cpu_end = time.time()
+        timing = {
+            'gpu_forward': t_gpu_end - t_gpu_start,
+            'cpu_entropy': t_cpu_end - t_cpu_start
+        }
+
+        return bit_streams, features_out, timing
 
     def decompress(self, bit_stream, sps, qp):
         dtype = next(self.parameters()).dtype

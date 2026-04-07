@@ -337,6 +337,8 @@ def encode_batch(p_frame_net, i_frame_net, seq_args_list,
 
             else:
                 # Batched path: stack frames and features, single forward pass.
+                
+                t_prep_start = time.time()
                 local_idxs = [active.index(i) for i in p_seqs]
                 x_batch = torch.cat([x_padded_list[li] for li in local_idxs],
                                     dim=0)   # [len(p_seqs), 3, H, W]
@@ -345,14 +347,25 @@ def encode_batch(p_frame_net, i_frame_net, seq_args_list,
                     [materialise_feature(p_frame_net, ref_frames[i])
                      for i in p_seqs],
                     dim=0)   # [len(p_seqs), g_ch_d, H', W']
+                torch.cuda.synchronize(device=device)
+                t_prep_end = time.time()
+                prep_time = t_prep_end - t_prep_start
 
-                batch_streams, features_out = p_frame_net.compress_batch(
+                batch_streams, features_out, c_timing = p_frame_net.compress_batch(
                     x_batch, curr_qp, mat_features)
 
                 torch.cuda.synchronize(device=device)
                 step_end  = time.time()
                 elapsed   = step_end - step_start
                 per_frame = elapsed / len(p_seqs)
+                
+                # accumulate profiling stats
+                if not hasattr(encode_batch, 'profiling_stats'):
+                    encode_batch.profiling_stats = {'prep': 0.0, 'gpu': 0.0, 'cpu': 0.0, 'count': 0}
+                encode_batch.profiling_stats['prep'] += prep_time
+                encode_batch.profiling_stats['gpu'] += c_timing['gpu_forward']
+                encode_batch.profiling_stats['cpu'] += c_timing['cpu_entropy']
+                encode_batch.profiling_stats['count'] += 1
 
                 for batch_pos, i in enumerate(p_seqs):
                     ref_frames[i].feature = features_out[batch_pos:batch_pos+1]
@@ -377,6 +390,14 @@ def encode_batch(p_frame_net, i_frame_net, seq_args_list,
 
     for sr in src_readers:
         sr.close()
+        
+    if hasattr(encode_batch, 'profiling_stats') and encode_batch.profiling_stats['count'] > 0:
+        st = encode_batch.profiling_stats
+        print(f"\n--- PROFILING RESULTS (Average per B={len(seq_args_list)} batched step over {st['count']} frames) ---")
+        print(f"Data Prep (cat, materialise): {st['prep']/st['count']*1000:.2f} ms")
+        print(f"GPU Forward Pass:             {st['gpu']/st['count']*1000:.2f} ms")
+        print(f"CPU Entropy Coding (seq):     {st['cpu']/st['count']*1000:.2f} ms")
+        print("--------------------------------------------------------------------------\n")
 
     # Pack results
     results = []
