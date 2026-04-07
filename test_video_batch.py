@@ -571,7 +571,8 @@ def run_one_batch(p_frame_net, i_frame_net, seq_args_list):
         if a.get('save_decoded_frame', False):
             writer.close()
 
-        test_time = time.time() - start_time
+        # Use wall-clock time from script start
+        test_time = time.time() - script_start_time
         enc_t = enc_results[i]['encoding_times']
         frame_types_i = enc_results[i]['frame_types']
         bits_i        = enc_results[i]['bits']
@@ -606,6 +607,7 @@ def run_one_batch(p_frame_net, i_frame_net, seq_args_list):
 
 i_frame_net = None
 p_frame_net = None
+script_start_time = None
 
 
 def worker(seq_args_list):
@@ -613,7 +615,7 @@ def worker(seq_args_list):
     Process pool worker: receives a list of per-sequence arg dicts and runs
     run_one_batch on them.  Returns a list of result dicts.
     """
-    global i_frame_net, p_frame_net
+    global i_frame_net, p_frame_net, script_start_time
     assert i_frame_net is not None and p_frame_net is not None
 
     for a in seq_args_list:
@@ -639,7 +641,7 @@ def worker(seq_args_list):
     return out
 
 
-def init_func(args, gpu_num):
+def init_func(args, gpu_num, start_time):
     set_torch_env()
 
     process_name = multiprocessing.current_process().name
@@ -655,7 +657,8 @@ def init_func(args, gpu_num):
     else:
         device = "cpu"
 
-    global i_frame_net
+    global i_frame_net, script_start_time
+    script_start_time = start_time
     i_frame_net = DMCI()
     i_state_dict = get_state_dict(args.model_path_i)
     i_frame_net.load_state_dict(i_state_dict)
@@ -786,7 +789,7 @@ def main():
     executor = concurrent.futures.ProcessPoolExecutor(
         max_workers=args.worker,
         initializer=init_func,
-        initargs=(args, gpu_num))
+        initargs=(args, gpu_num, begin_time))
 
     objs = [executor.submit(worker, batch) for batch in job_batches]
 
