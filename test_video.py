@@ -323,7 +323,8 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, args):
     if save_decoded_frame:
         recon_writer.close()
 
-    test_time = time.time() - start_time
+    # Use wall-clock time from script start
+    test_time = time.time() - script_start_time
     test_time_frame_numuber = len(encoding_time)
     time_bypass_frame_num = 10  # bypass the first 10 frames as warmup
     if verbose >= 1 and test_time_frame_numuber > time_bypass_frame_num:
@@ -349,11 +350,11 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, args):
 
 i_frame_net = None  # the model is initialized after each process is spawn, thus OK for multiprocess
 p_frame_net = None
+script_start_time = None
 
 
 def worker(args):
-    global i_frame_net
-    global p_frame_net
+    global i_frame_net, p_frame_net, script_start_time
 
     sub_dir_name = args['seq']
     bin_folder = os.path.join(args['stream_path'], args['ds_name'])
@@ -378,7 +379,7 @@ def worker(args):
     return result
 
 
-def init_func(args, gpu_num):
+def init_func(args, gpu_num, start_time):
     set_torch_env()
 
     process_name = multiprocessing.current_process().name
@@ -394,7 +395,8 @@ def init_func(args, gpu_num):
     else:
         device = "cpu"
 
-    global i_frame_net
+    global i_frame_net, script_start_time
+    script_start_time = start_time
     i_frame_net = DMCI()
     i_state_dict = get_state_dict(args.model_path_i)
     i_frame_net.load_state_dict(i_state_dict)
@@ -439,7 +441,7 @@ def main():
     multiprocessing.set_start_method("spawn")
     threadpool_executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_num,
                                                                  initializer=init_func,
-                                                                 initargs=(args, gpu_num))
+                                                                 initargs=(args, gpu_num, begin_time))
     objs = []
 
     count_frames = 0
