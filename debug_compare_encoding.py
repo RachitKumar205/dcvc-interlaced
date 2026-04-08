@@ -8,63 +8,88 @@ exactly where and why the batched path diverges from the sequential baseline.
 
 THREE PATHS COMPARED
 --------------------
-1. SEQUENTIAL   : The reference path. Uses p_frame_net.compress() exactly
-                  as test_video.py does — one frame at a time, model manages
-                  its own DPB internally.
+1. SEQ     : The reference path. Uses p_frame_net.compress() exactly as
+             test_video.py does — one frame at a time, model manages its
+             own DPB internally.
 
-2. BATCH-1      : Uses compress_batch() with B=1 (single sequence, no
-                  inter-sequence interaction). If this diverges from SEQUENTIAL,
-                  the bug is inside compress_batch() itself — independent of
-                  any batching interaction between sequences.
+2. BATCH-1 : Uses compress_batch() with B=1 (single sequence, no
+             inter-sequence interaction). If this diverges from SEQ, the
+             bug is inside compress_batch() itself — independent of any
+             batching interaction between sequences.
 
-3. BATCH-2      : Uses compress_batch() with B=2 (same frame duplicated).
-                  If this diverges from BATCH-1, the bug is caused by
-                  inter-sequence state leakage when N>1.
+3. BATCH-2 : Uses compress_batch() with B=2 (same frame fed as both
+             sequences). If this diverges from BATCH-1, the bug is caused
+             by inter-sequence state leakage when N>1.
 
-WHAT WE CHECK AT EACH FRAME
-----------------------------
-For each P-frame:
+WHAT WE MEASURE AT EACH FRAME
+-------------------------------
+For each P-frame we check four things:
 
-  a) Materialised feature (input to forward pass)
-     The reference feature passed into the encoder. If this differs between
-     paths, the state carried from the previous frame is wrong — the bug is
-     in how we store/restore ref_frames between frames.
+  a) Materialised feature diff (input to the forward pass)
+     The reference feature fed into the encoder. If this differs between
+     paths at frame K, the state carried forward from frame K-1 is wrong —
+     meaning ref_frames are being corrupted between frames.
 
-  b) Bitstream bytes
+  b) Bitstream match
      The actual encoded bytes. If these differ despite identical inputs,
-     the entropy coder has state left over from a previous call.
+     the entropy coder has stale internal state from a previous call.
 
-  c) Decoder output feature (output of forward pass)
-     The feature stored back into ref_frames for the next frame. If this
-     differs despite identical inputs, there is a numerical issue inside
-     compress_batch() vs compress().
+  c) Decoder output feature diff (output of forward pass, stored as ref
+     for next frame). If this differs despite identical inputs, there is a
+     numerical divergence inside compress_batch() vs compress().
 
   d) Cumulative drift
-     We track the max absolute difference in the running ref_feature across
-     all frames to detect if small per-frame errors compound over time.
+     The running max absolute difference between SEQ and BATCH-1/BATCH-2
+     reference features, accumulated across all frames. This detects small
+     per-frame errors that would be invisible to the per-frame threshold
+     but compound into visible PSNR loss over a full sequence.
 
-HOW TO READ THE OUTPUT
-----------------------
-- If materialised features match but bitstreams differ: entropy coder state leak
-- If materialised features differ: ref_frame state is being corrupted between frames
-- If both materialised features AND bitstreams match but decoder output differs:
-  bug is inside compress_batch() forward pass
-- BATCH-1 == SEQ but BATCH-2 != SEQ: inter-sequence state leakage in B=2 path
-- BATCH-1 != SEQ: bug is in compress_batch() itself, independent of batch size
+  e) Internal BATCH-2 consistency (slot 0 vs slot 1)
+     Since both B=2 slots receive identical inputs, their outputs must be
+     identical. Any divergence here means the B=2 forward pass is
+     corrupting one slot with the other's state.
 
-Usage:
-    python debug_compare_encoding.py \
-        --model_path_i ./checkpoints/cvpr2025_image.pth.tar \
-        --model_path_p ./checkpoints/cvpr2025_video.pth.tar \
-        --test_video  test_data/UVG/ShakeNDry_640x360_120fps_420_8bit_YUV.yuv \
-        --width 640 --height 360 --qp 0 --num_frames 100
+AUTO-DIAGNOSIS LOGIC
+--------------------
+After the full run, the script prints a diagnosis based on which
+divergence trackers fired, checked independently (not in an elif chain):
+
+  - If BATCH-1 decoder output diverges from SEQ:
+    => Bug is inside compress_batch() itself (B=1 already breaks it).
+
+  - If BATCH-1 matches SEQ but BATCH-2 diverges:
+    => Bug is inter-sequence state leakage in the B=2 forward pass.
+
+  - If materialised features diverge before decoder outputs:
+    => Bug is in how ref_frames state is stored/restored between frames.
+
+  - If only bitstreams diverge (features match):
+    => Bug is entropy coder state leaking between calls.
+
+  - If cumulative drift is significant but per-frame diffs are small:
+    => Small per-frame errors are compounding — check float16 precision.
+
+  - If nothing diverges:
+    => Encoding is correct. Bug is in the decode path (not tested here).
+    => Re-run with --also_decode to test the full encode+decode cycle.
+
+HOW TO RUN
+----------
+    python debug_compare_encoding.py \\
+        --model_path_i ./checkpoints/cvpr2025_image.pth.tar \\
+        --model_path_p ./checkpoints/cvpr2025_video.pth.tar \\
+        --test_video  test_data/UVG/ShakeNDry_640x360_120fps_420_8bit_YUV.yuv \\
+        --width 640 --height 360 --qp 0 --num_frames 100 \\
+        --reset_interval 32
+
+IMPORTANT: --reset_interval must match the value used in test_video_batch.py
+           (default 32, same as this script's default).
 """
 
 import argparse
 import io
 import os
 import sys
-import time
 
 import numpy as np
 import torch
@@ -80,7 +105,7 @@ from src.utils.yuv import YUV420Reader
 
 
 # ---------------------------------------------------------------------------
-# Helpers (mirrors test_video_batch.py exactly so we test the same logic)
+# Helpers — mirror test_video_batch.py exactly
 # ---------------------------------------------------------------------------
 
 def ycbcr420_to_444_np(y, uv):
@@ -95,35 +120,32 @@ def replicate_pad(x, pad_b, pad_r):
 
 def materialise_feature(p_frame_net, ref_frame):
     """
-    Derive the reference feature for the encoder/decoder without modifying
-    p_frame_net.dpb. Mirrors apply_feature_adaptor() in the model:
-      - After I-frame: pixel_unshuffle the reconstructed pixels, then feature_adaptor_i
-      - After P-frame: feature_adaptor_p on the stored decoder output feature
+    Derive the reference feature that the encoder/decoder will use as
+    context for this frame.  Mirrors DMC.apply_feature_adaptor() exactly:
+      - After I-frame  : pixel_unshuffle the reconstructed pixels → feature_adaptor_i
+      - After P-frame  : feature_adaptor_p on the stored decoder output feature
+    We call this externally (without touching self.dpb) so the same tensor
+    can be reused across all three paths without the model's DPB getting in the way.
     """
     if ref_frame.feature is not None:
         return p_frame_net.feature_adaptor_p(ref_frame.feature)
     return p_frame_net.feature_adaptor_i(F.pixel_unshuffle(ref_frame.frame, 8))
 
 
-def tensor_diff(a, b):
-    """Return (max_abs_diff, mean_abs_diff) between two tensors."""
+def tensor_diff_f32(a, b):
+    """
+    Compute max and mean absolute difference in float32.
+    We explicitly upcast from float16 here because float16 has a machine
+    epsilon of ~9.77e-4 near 1.0 — differences smaller than that are
+    invisible if we compare in half precision.  Upcasting to float32
+    (epsilon ~1.2e-7) lets us detect much smaller discrepancies.
+    """
     d = (a.float() - b.float()).abs()
     return d.max().item(), d.mean().item()
 
 
 def bytes_match(a, b):
-    """Return True if two byte strings are identical."""
     return a == b
-
-
-def first_differing_byte(a, b):
-    """Return index of first byte that differs, or -1 if identical."""
-    for i, (x, y) in enumerate(zip(a, b)):
-        if x != y:
-            return i
-    if len(a) != len(b):
-        return min(len(a), len(b))
-    return -1
 
 
 # ---------------------------------------------------------------------------
@@ -133,45 +155,60 @@ def first_differing_byte(a, b):
 def main():
     parser = argparse.ArgumentParser(
         description="Compare sequential vs batched encoding frame-by-frame")
-    parser.add_argument('--model_path_i', type=str, required=True)
-    parser.add_argument('--model_path_p', type=str, required=True)
-    parser.add_argument('--test_video',   type=str, required=True)
-    parser.add_argument('--width',        type=int, default=640)
-    parser.add_argument('--height',       type=int, default=360)
-    parser.add_argument('--qp',           type=int, default=0)
-    parser.add_argument('--num_frames',   type=int, default=100)
-    parser.add_argument('--reset_interval', type=int, default=64,
-                        help="Must match what test_video_batch.py uses")
+    parser.add_argument('--model_path_i',    type=str, required=True)
+    parser.add_argument('--model_path_p',    type=str, required=True)
+    parser.add_argument('--test_video',      type=str, required=True)
+    parser.add_argument('--width',           type=int, default=640)
+    parser.add_argument('--height',          type=int, default=360)
+    parser.add_argument('--qp',              type=int, default=0)
+    parser.add_argument('--num_frames',      type=int, default=100)
+    parser.add_argument('--reset_interval',  type=int, default=32,
+                        help="Must match --reset_interval used in test_video_batch.py (default: 32)")
     args = parser.parse_args()
 
     set_torch_env()
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
-    print(f"Video:  {args.test_video}  ({args.width}x{args.height})")
-    print(f"QP:     {args.qp}   Frames: {args.num_frames}   Reset interval: {args.reset_interval}")
+
+    # -----------------------------------------------------------------------
+    # Determine two-entropy-coder mode — mirrors test_video_batch.py line 488
+    # use_two_entropy_coders is True for content larger than 1280x720.
+    # This flag changes the internal RANS codec configuration and must be
+    # set before any encoding/decoding calls, otherwise the bitstreams will
+    # be structured differently from what the test harness produces.
+    # -----------------------------------------------------------------------
+    use_two_ec = (args.height * args.width) > (1280 * 720)
+
+    print(f"Device:                  {device}")
+    print(f"Video:                   {args.test_video}  ({args.width}x{args.height})")
+    print(f"QP:                      {args.qp}")
+    print(f"Frames:                  {args.num_frames}")
+    print(f"Reset interval:          {args.reset_interval}")
+    print(f"use_two_entropy_coders:  {use_two_ec}")
     print()
 
     # -----------------------------------------------------------------------
-    # Load models
+    # Load models — mirrors test_video_batch.py init_func()
     # -----------------------------------------------------------------------
     i_frame_net = DMCI()
     i_frame_net.load_state_dict(get_state_dict(args.model_path_i))
     i_frame_net = i_frame_net.to(device).eval()
     i_frame_net.half()
     i_frame_net.update()
+    i_frame_net.set_use_two_entropy_coders(use_two_ec)
 
     p_frame_net = DMC()
     p_frame_net.load_state_dict(get_state_dict(args.model_path_p))
     p_frame_net = p_frame_net.to(device).eval()
     p_frame_net.half()
     p_frame_net.update()
+    p_frame_net.set_use_two_entropy_coders(use_two_ec)
 
     w, h = args.width, args.height
     pad_r, pad_b = DMCI.get_padding_size(h, w, 16)
     index_map = [0, 1, 0, 2, 0, 2, 0, 2]
 
     # -----------------------------------------------------------------------
-    # Read all frames up front so I/O doesn't interfere with timing
+    # Read all frames up front
     # -----------------------------------------------------------------------
     reader = YUV420Reader(args.test_video, w, h)
     frames = []
@@ -184,68 +221,96 @@ def main():
     print(f"Read {len(frames)} frames.\n")
 
     # -----------------------------------------------------------------------
-    # Per-path state: one RefFrame per path to track temporal state
+    # Per-path ref state — one RefFrame per path
     # -----------------------------------------------------------------------
-    ref_seq   = RefFrame()   # SEQUENTIAL path state
-    ref_b1    = RefFrame()   # BATCH-1 path state
-    ref_b2_0  = RefFrame()   # BATCH-2 path state, sequence slot 0
-    ref_b2_1  = RefFrame()   # BATCH-2 path state, sequence slot 1 (duplicate)
+    ref_seq  = RefFrame()   # SEQ path
+    ref_b1   = RefFrame()   # BATCH-1 path
+    ref_b2_0 = RefFrame()   # BATCH-2 slot 0
+    ref_b2_1 = RefFrame()   # BATCH-2 slot 1 (receives identical input to slot 0)
 
-    # Per-path last_qp for reset_interval handling
-    last_qp_seq  = 0
-    last_qp_b1   = 0
-    last_qp_b2   = 0
+    last_qp_seq = last_qp_b1 = last_qp_b2 = 0
 
-    # Accumulators for summary
-    first_mat_divergence   = None   # first frame where mat feature diverges
-    first_bits_divergence  = None   # first frame where bitstream diverges
-    first_feat_divergence  = None   # first frame where decoder output diverges
-    first_b2_divergence    = None   # first frame where BATCH-2 diverges from SEQ
+    # -----------------------------------------------------------------------
+    # Divergence trackers
+    # These track the *first* frame at which each type of divergence occurs.
+    # Checked independently (not in an elif chain) so multiple root causes
+    # can be identified simultaneously.
+    # -----------------------------------------------------------------------
+    first_mat_div_b1   = None   # materialised feature: BATCH-1 vs SEQ
+    first_mat_div_b2   = None   # materialised feature: BATCH-2 vs SEQ
+    first_bits_div_b1  = None   # bitstream bytes:      BATCH-1 vs SEQ
+    first_bits_div_b2  = None   # bitstream bytes:      BATCH-2 vs SEQ
+    first_feat_div_b1  = None   # decoder output feat:  BATCH-1 vs SEQ
+    first_feat_div_b2  = None   # decoder output feat:  BATCH-2 vs SEQ
+    first_b2_internal  = None   # BATCH-2 internal:     slot 0 vs slot 1
 
-    print("=" * 90)
-    print(f"{'Frame':>5}  {'Type':>4}  "
-          f"{'MatFeat(B1-SEQ)':>18}  {'MatFeat(B2-SEQ)':>18}  "
-          f"{'Bits match':>10}  "
-          f"{'DecFeat(B1-SEQ)':>18}  {'DecFeat(B2-SEQ)':>18}")
-    print("=" * 90)
+    # -----------------------------------------------------------------------
+    # Cumulative drift accumulators
+    # We add the per-frame max absolute feature difference to these running
+    # totals to detect small-but-compounding errors that would be invisible
+    # if you only look at the per-frame threshold.
+    # -----------------------------------------------------------------------
+    cum_drift_b1 = 0.0   # sum of per-frame max|feat_b1 - feat_seq|
+    cum_drift_b2 = 0.0   # sum of per-frame max|feat_b2 - feat_seq|
+
+    # Threshold for flagging a per-frame difference as significant.
+    # Using 1e-3 (relative to typical feature magnitudes) rather than 1e-4
+    # because float16 machine epsilon near 1.0 is ~9.77e-4, so anything
+    # below that threshold could simply be float16 rounding.
+    THRESH = 1e-3
+
+    # -----------------------------------------------------------------------
+    # Per-frame loop
+    # -----------------------------------------------------------------------
+    print("=" * 110)
+    print(f"{'Frame':>5}  {'T':>1}  "
+          f"{'MatDiff B1-SEQ':>16}  {'MatDiff B2-SEQ':>16}  "
+          f"{'Bits B1':>7}  {'Bits B2':>7}  "
+          f"{'FeatDiff B1-SEQ':>16}  {'FeatDiff B2-SEQ':>16}  "
+          f"{'B2 internal':>12}  {'Notes'}")
+    print("=" * 110)
 
     with torch.no_grad():
         for frame_idx in range(args.num_frames):
-            x = frames[frame_idx]
+            x    = frames[frame_idx]
             qp_i = args.qp
             fa_idx = index_map[frame_idx % 8]
-            qp_p = p_frame_net.shift_qp(args.qp, fa_idx)
-            is_i = (frame_idx == 0)
+            qp_p   = p_frame_net.shift_qp(args.qp, fa_idx)
+            is_i   = (frame_idx == 0)
 
             # ------------------------------------------------------------------
-            # I-FRAME: all three paths use the same i_frame_net.compress()
+            # I-FRAME (frame 0): all paths use the same i_frame_net.compress().
+            # All paths start with the same reconstructed I-frame x_hat,
+            # so their ref states are initialised identically.
             # ------------------------------------------------------------------
             if is_i:
                 encoded_i = i_frame_net.compress(x, qp_i)
-                x_hat_i = encoded_i['x_hat']
+                x_hat_i   = encoded_i['x_hat']
 
-                # All paths start with the same reconstructed I-frame
-                ref_seq.frame  = x_hat_i;  ref_seq.feature  = None
-                ref_b1.frame   = x_hat_i;  ref_b1.feature   = None
-                ref_b2_0.frame = x_hat_i;  ref_b2_0.feature = None
-                ref_b2_1.frame = x_hat_i;  ref_b2_1.feature = None
+                for ref in (ref_seq, ref_b1, ref_b2_0, ref_b2_1):
+                    ref.frame   = x_hat_i
+                    ref.feature = None
 
                 last_qp_seq = last_qp_b1 = last_qp_b2 = qp_i
-                print(f"{frame_idx:>5}  {'I':>4}  "
-                      f"{'(I-frame, shared)':>18}  {'(I-frame, shared)':>18}  "
-                      f"{'yes':>10}  "
-                      f"{'(I-frame, shared)':>18}  {'(I-frame, shared)':>18}")
+                print(f"{frame_idx:>5}  I  {'(shared I-frame)':>16}  {'(shared I-frame)':>16}  "
+                      f"{'yes':>7}  {'yes':>7}  "
+                      f"{'(shared I-frame)':>16}  {'(shared I-frame)':>16}  "
+                      f"{'ok':>12}")
                 continue
 
             # ------------------------------------------------------------------
-            # RESET INTERVAL: mirrors test_video_batch.py lines 291-299
-            # If frame_idx % reset_interval == 1, prepare_feature_adaptor_i
-            # is called to regenerate the pixel reference from the feature.
-            # We do this identically for all three paths.
+            # RESET INTERVAL — mirrors test_video_batch.py lines 291-299.
+            # At frame_idx % reset_interval == 1, prepare_feature_adaptor_i()
+            # regenerates the pixel-space reference from the stored feature.
+            # We apply this to all four ref states using the same code path
+            # as the test harness, so all paths remain in sync.
+            # Note: this is a decoder-side preparation step; it sets
+            # dpb[0].feature = None so that apply_feature_adaptor() will
+            # use the pixel path (feature_adaptor_i) on the next frame.
             # ------------------------------------------------------------------
             if args.reset_interval > 0 and frame_idx % args.reset_interval == 1:
-                for ref, lqp in [(ref_seq, last_qp_seq),
-                                  (ref_b1,  last_qp_b1),
+                for ref, lqp in [(ref_seq,  last_qp_seq),
+                                  (ref_b1,   last_qp_b1),
                                   (ref_b2_0, last_qp_b2),
                                   (ref_b2_1, last_qp_b2)]:
                     p_frame_net.clear_dpb()
@@ -255,64 +320,82 @@ def main():
                     ref.feature = p_frame_net.dpb[0].feature
 
             # ------------------------------------------------------------------
-            # MATERIALISE FEATURES for each path
-            # This is the reference feature that will be fed into the encoder.
-            # Comparing these first tells us if the *input* to the forward pass
-            # is the same across all three paths.
+            # MATERIALISE FEATURES
+            # Compute the reference feature that the encoder will use as context.
+            # We do this BEFORE the forward passes so we can compare the inputs
+            # independently of the outputs.  If these differ, the bug is in
+            # how ref_frames are stored/restored between frames — not inside
+            # the forward pass itself.
+            # All four materialise calls use the same stateless neural layers
+            # (feature_adaptor_p / feature_adaptor_i), so running them
+            # sequentially does not cause state contamination.
             # ------------------------------------------------------------------
             mat_seq  = materialise_feature(p_frame_net, ref_seq)
             mat_b1   = materialise_feature(p_frame_net, ref_b1)
             mat_b2_0 = materialise_feature(p_frame_net, ref_b2_0)
             mat_b2_1 = materialise_feature(p_frame_net, ref_b2_1)
 
-            mat_diff_b1_seq,  _ = tensor_diff(mat_b1,   mat_seq)
-            mat_diff_b2_seq,  _ = tensor_diff(mat_b2_0, mat_seq)
+            # Compare in float32 to avoid float16 epsilon masking differences
+            mat_diff_b1, _ = tensor_diff_f32(mat_b1,   mat_seq)
+            mat_diff_b2, _ = tensor_diff_f32(mat_b2_0, mat_seq)
 
-            if first_mat_divergence is None and (mat_diff_b1_seq > 1e-4 or mat_diff_b2_seq > 1e-4):
-                first_mat_divergence = frame_idx
+            if first_mat_div_b1 is None and mat_diff_b1 > THRESH:
+                first_mat_div_b1 = frame_idx
+            if first_mat_div_b2 is None and mat_diff_b2 > THRESH:
+                first_mat_div_b2 = frame_idx
 
             # ------------------------------------------------------------------
-            # PATH 1: SEQUENTIAL — p_frame_net.compress() with internal DPB
+            # PATH 1: SEQUENTIAL — p_frame_net.compress() with internal DPB.
+            # We clear and reload the DPB with ref_seq state before each call
+            # so the model's DPB exactly matches what this path expects.
+            # compress() will call self.apply_feature_adaptor() → reads dpb[0],
+            # then at the end calls self.add_ref_frame() → writes dpb[0].
+            # We read the decoder output feature back from dpb[0] after the call.
             # ------------------------------------------------------------------
             p_frame_net.clear_dpb()
             p_frame_net.add_ref_frame(ref_seq.feature, ref_seq.frame)
-            p_frame_net.set_curr_poc(frame_idx)
-            enc_seq = p_frame_net.compress(x, qp_p)
-            bits_seq     = enc_seq['bit_stream']
-            feat_seq     = p_frame_net.dpb[0].feature.clone()
-            # Update sequential ref state
+            enc_seq  = p_frame_net.compress(x, qp_p)
+            bits_seq = enc_seq['bit_stream']
+            feat_seq = p_frame_net.dpb[0].feature.clone()
+
             ref_seq.feature = feat_seq
             ref_seq.frame   = None
             last_qp_seq     = qp_p
 
             # ------------------------------------------------------------------
-            # PATH 2: BATCH-1 — compress_batch() with B=1
-            # Same single frame, same reference feature as sequential.
-            # Any divergence here means compress_batch() has a bug vs compress().
+            # PATH 2: BATCH-1 — compress_batch() with B=1.
+            # compress_batch() does NOT read from or write to self.dpb — it
+            # receives the reference feature as an explicit argument (mat_b1)
+            # and returns decoder output features directly.  This means it is
+            # fully stateless w.r.t. the model's DPB.
+            # If B=1 already diverges from SEQ despite identical inputs,
+            # the bug is inside the compress_batch() implementation itself.
             # ------------------------------------------------------------------
-            batch_streams_b1, feat_out_b1, _ = p_frame_net.compress_batch(
-                x, qp_p, mat_b1)
-            bits_b1  = batch_streams_b1[0]
-            feat_b1  = feat_out_b1[0:1].clone()
-            # Update BATCH-1 ref state
+            streams_b1, feats_b1, _ = p_frame_net.compress_batch(x, qp_p, mat_b1)
+            bits_b1  = streams_b1[0]
+            feat_b1  = feats_b1[0:1].clone()
+
             ref_b1.feature = feat_b1
             ref_b1.frame   = None
             last_qp_b1     = qp_p
 
             # ------------------------------------------------------------------
-            # PATH 3: BATCH-2 — compress_batch() with B=2 (same frame twice)
-            # Any divergence vs BATCH-1 means inter-sequence state leakage
-            # when processing N>1 sequences in a single batch.
+            # PATH 3: BATCH-2 — compress_batch() with B=2 (same frame twice).
+            # Both slots receive identical input tensors and identical reference
+            # features.  Their outputs MUST be identical (slot 0 == slot 1).
+            # Any divergence between slots exposes inter-sequence state leakage
+            # inside the B=2 forward pass.
+            # Any divergence vs BATCH-1 (which ran the same computation at B=1)
+            # means something about the B=2 batching itself changes the result.
             # ------------------------------------------------------------------
-            x_batch    = torch.cat([x, x], dim=0)
-            mat_b2     = torch.cat([mat_b2_0, mat_b2_1], dim=0)
-            batch_streams_b2, feat_out_b2, _ = p_frame_net.compress_batch(
-                x_batch, qp_p, mat_b2)
-            bits_b2_0  = batch_streams_b2[0]
-            bits_b2_1  = batch_streams_b2[1]
-            feat_b2_0  = feat_out_b2[0:1].clone()
-            feat_b2_1  = feat_out_b2[1:2].clone()
-            # Update BATCH-2 ref state (use slot 0 as representative)
+            x_batch  = torch.cat([x, x],             dim=0)
+            mat_b2   = torch.cat([mat_b2_0, mat_b2_1], dim=0)
+            streams_b2, feats_b2, _ = p_frame_net.compress_batch(x_batch, qp_p, mat_b2)
+            bits_b2_0 = streams_b2[0]
+            bits_b2_1 = streams_b2[1]
+            feat_b2_0 = feats_b2[0:1].clone()
+            feat_b2_1 = feats_b2[1:2].clone()
+
             ref_b2_0.feature = feat_b2_0
             ref_b2_0.frame   = None
             ref_b2_1.feature = feat_b2_1
@@ -323,92 +406,146 @@ def main():
             # COMPARE RESULTS
             # ------------------------------------------------------------------
 
-            # Bitstream comparison
-            # Checks if the entropy coder produces identical bytes.
-            # Note: BATCH-2 slot 0 and slot 1 should also match each other since
-            # they received identical inputs.
-            bits_b1_match_seq  = bytes_match(bits_b1,   bits_seq)
-            bits_b2_match_seq  = bytes_match(bits_b2_0, bits_seq)
-            bits_b2_internal   = bytes_match(bits_b2_0, bits_b2_1)  # sanity: both slots identical?
+            # Bitstreams (bytes-exact comparison)
+            bm_b1  = bytes_match(bits_b1,   bits_seq)
+            bm_b2  = bytes_match(bits_b2_0, bits_seq)
+            bm_int = bytes_match(bits_b2_0, bits_b2_1)  # B=2 internal consistency
 
-            if first_bits_divergence is None and not (bits_b1_match_seq and bits_b2_match_seq):
-                first_bits_divergence = frame_idx
+            if first_bits_div_b1 is None and not bm_b1:
+                first_bits_div_b1 = frame_idx
+            if first_bits_div_b2 is None and not bm_b2:
+                first_bits_div_b2 = frame_idx
 
-            # Decoder output feature comparison
-            # These features are stored in ref_frames and used as reference for
-            # the next frame. Any difference here will compound over time.
-            feat_diff_b1_seq,  feat_mean_b1  = tensor_diff(feat_b1,   feat_seq)
-            feat_diff_b2_seq,  feat_mean_b2  = tensor_diff(feat_b2_0, feat_seq)
-            feat_diff_b2_int,  _             = tensor_diff(feat_b2_0, feat_b2_1)  # sanity
+            # Decoder output features (in float32 for sensitivity)
+            feat_diff_b1, feat_mean_b1 = tensor_diff_f32(feat_b1,   feat_seq)
+            feat_diff_b2, feat_mean_b2 = tensor_diff_f32(feat_b2_0, feat_seq)
+            feat_diff_int, _           = tensor_diff_f32(feat_b2_0, feat_b2_1)
 
-            if first_feat_divergence is None and feat_diff_b1_seq > 1e-4:
-                first_feat_divergence = frame_idx
-            if first_b2_divergence is None and feat_diff_b2_seq > 1e-4:
-                first_b2_divergence = frame_idx
+            if first_feat_div_b1 is None and feat_diff_b1 > THRESH:
+                first_feat_div_b1 = frame_idx
+            if first_feat_div_b2 is None and feat_diff_b2 > THRESH:
+                first_feat_div_b2 = frame_idx
+            if first_b2_internal is None and feat_diff_int > THRESH:
+                first_b2_internal = frame_idx
+
+            # Cumulative drift — accumulated max difference in reference features.
+            # Even if per-frame differences are below THRESH, a non-zero
+            # accumulation here means errors are building up over time.
+            cum_drift_b1 += feat_diff_b1
+            cum_drift_b2 += feat_diff_b2
 
             # ------------------------------------------------------------------
-            # Print per-frame summary row
-            # Format: frame | type | mat_diff_b1 | mat_diff_b2 | bits_match | feat_diff_b1 | feat_diff_b2
+            # Per-frame print
+            # Flags: !! marks any column that exceeds THRESH or mismatches.
             # ------------------------------------------------------------------
-            bits_col = ("yes" if (bits_b1_match_seq and bits_b2_match_seq and bits_b2_internal)
-                        else f"B1:{int(bits_b1_match_seq)} B2:{int(bits_b2_match_seq)} int:{int(bits_b2_internal)}")
+            notes = []
+            if mat_diff_b1 > THRESH:  notes.append("MAT-B1!")
+            if mat_diff_b2 > THRESH:  notes.append("MAT-B2!")
+            if not bm_b1:             notes.append("BITS-B1!")
+            if not bm_b2:             notes.append("BITS-B2!")
+            if not bm_int:            notes.append("BITS-INT!")
+            if feat_diff_b1 > THRESH: notes.append("FEAT-B1!")
+            if feat_diff_b2 > THRESH: notes.append("FEAT-B2!")
+            if feat_diff_int > THRESH:notes.append("FEAT-INT!")
 
-            # Flag frames with significant divergence with a marker
-            flag = ""
-            if mat_diff_b1_seq > 1e-4 or feat_diff_b1_seq > 1e-4:
-                flag += " !! B1"
-            if mat_diff_b2_seq > 1e-4 or feat_diff_b2_seq > 1e-4:
-                flag += " !! B2"
-            if feat_diff_b2_int > 1e-4:
-                flag += " !! B2-int"
+            b2int_str = "ok" if (bm_int and feat_diff_int <= THRESH) else f"{feat_diff_int:.2e}"
 
-            print(f"{frame_idx:>5}  {'P':>4}  "
-                  f"{mat_diff_b1_seq:>18.6e}  {mat_diff_b2_seq:>18.6e}  "
-                  f"{bits_col:>10}  "
-                  f"{feat_diff_b1_seq:>18.6e}  {feat_diff_b2_seq:>18.6e}"
-                  f"{flag}")
+            print(f"{frame_idx:>5}  P  "
+                  f"{mat_diff_b1:>16.4e}  {mat_diff_b2:>16.4e}  "
+                  f"{'yes' if bm_b1 else 'NO':>7}  {'yes' if bm_b2 else 'NO':>7}  "
+                  f"{feat_diff_b1:>16.4e}  {feat_diff_b2:>16.4e}  "
+                  f"{b2int_str:>12}  "
+                  f"{' '.join(notes)}")
 
     # -----------------------------------------------------------------------
-    # Final summary
+    # SUMMARY
     # -----------------------------------------------------------------------
     print()
-    print("=" * 90)
+    print("=" * 110)
     print("SUMMARY")
-    print("=" * 90)
-    print(f"First frame where materialised feature diverges (B1 or B2 vs SEQ): "
-          f"{first_mat_divergence if first_mat_divergence is not None else 'never'}")
-    print(f"First frame where bitstream diverges (B1 or B2 vs SEQ):            "
-          f"{first_bits_divergence if first_bits_divergence is not None else 'never'}")
-    print(f"First frame where decoder output feature diverges (B1 vs SEQ):     "
-          f"{first_feat_divergence if first_feat_divergence is not None else 'never'}")
-    print(f"First frame where decoder output feature diverges (B2 vs SEQ):     "
-          f"{first_b2_divergence if first_b2_divergence is not None else 'never'}")
+    print("=" * 110)
+    print(f"  First frame: materialised feature diverges  B1 vs SEQ : {first_mat_div_b1  or 'never'}")
+    print(f"  First frame: materialised feature diverges  B2 vs SEQ : {first_mat_div_b2  or 'never'}")
+    print(f"  First frame: bitstream diverges             B1 vs SEQ : {first_bits_div_b1 or 'never'}")
+    print(f"  First frame: bitstream diverges             B2 vs SEQ : {first_bits_div_b2 or 'never'}")
+    print(f"  First frame: decoder feature diverges       B1 vs SEQ : {first_feat_div_b1 or 'never'}")
+    print(f"  First frame: decoder feature diverges       B2 vs SEQ : {first_feat_div_b2 or 'never'}")
+    print(f"  First frame: BATCH-2 internal inconsistency (s0 vs s1): {first_b2_internal or 'never'}")
+    print(f"  Cumulative feature drift  B1 vs SEQ (sum of per-frame max): {cum_drift_b1:.6f}")
+    print(f"  Cumulative feature drift  B2 vs SEQ (sum of per-frame max): {cum_drift_b2:.6f}")
     print()
 
-    # Interpret the findings
-    if first_mat_divergence is None and first_feat_divergence is not None:
-        print("DIAGNOSIS: Materialised features are identical (inputs are correct),")
-        print("           but compress_batch(B=1) produces different decoder output features.")
-        print("           => BUG IS INSIDE compress_batch() FORWARD PASS vs compress().")
+    # -----------------------------------------------------------------------
+    # AUTO-DIAGNOSIS
+    # Checks each failure mode independently.  Multiple may be printed if
+    # multiple root causes are present simultaneously.
+    # -----------------------------------------------------------------------
+    print("DIAGNOSIS")
+    print("-" * 110)
+    diagnosed = False
 
-    elif first_mat_divergence is not None:
-        print("DIAGNOSIS: Materialised features diverge — the reference state stored in")
-        print("           ref_frames is being corrupted between frames.")
-        print("           => BUG IS IN HOW ref_frames ARE UPDATED AFTER EACH FRAME.")
+    # Check B1 first — if B1 already breaks, B2 is irrelevant.
+    if first_feat_div_b1 is not None:
+        print(f"[B1 FAIL] compress_batch(B=1) produces different decoder output features")
+        print(f"          from compress() starting at frame {first_feat_div_b1}, despite receiving")
+        print(f"          identical input tensors.  The bug is INSIDE compress_batch() itself,")
+        print(f"          independent of batching.  Compare the two implementations carefully:")
+        print(f"          compress() in video_model.py:299 vs compress_batch() in video_model.py:343.")
+        diagnosed = True
 
-    elif first_bits_divergence is not None and first_feat_divergence is None:
-        print("DIAGNOSIS: Decoder output features match but bitstreams diverge.")
-        print("           => BUG IS IN THE ENTROPY CODER STATE between calls.")
+    if first_bits_div_b1 is not None and first_feat_div_b1 is None:
+        print(f"[BITS-B1] Bitstreams diverge at frame {first_bits_div_b1} but decoder output features match.")
+        print(f"          The forward pass is numerically identical but the entropy coder")
+        print(f"          is producing different bytes.  Likely cause: entropy_coder has")
+        print(f"          stale internal state from the previous compress() call that is")
+        print(f"          not fully cleared by entropy_coder.reset() in compress_batch().")
+        diagnosed = True
 
-    elif first_b2_divergence is not None and first_feat_divergence is None:
-        print("DIAGNOSIS: BATCH-1 matches SEQ perfectly, but BATCH-2 diverges.")
-        print("           => BUG IS INTER-SEQUENCE STATE LEAKAGE in B=2 path.")
+    # Check B2 independently of B1.
+    if first_b2_internal is not None:
+        print(f"[B2 INT]  BATCH-2 slots 0 and 1 diverge at frame {first_b2_internal} despite")
+        print(f"          receiving IDENTICAL inputs.  This is direct evidence of inter-sequence")
+        print(f"          state leakage within the B=2 forward pass in compress_batch().")
+        diagnosed = True
 
-    elif first_feat_divergence is None and first_b2_divergence is None:
-        print("DIAGNOSIS: All three paths match perfectly.")
-        print("           => The encoding logic is correct. Bug may be in test harness.")
-    else:
-        print("DIAGNOSIS: Multiple issues detected. Review per-frame output above.")
+    if first_feat_div_b2 is not None and first_feat_div_b1 is None:
+        print(f"[B2 FAIL] BATCH-1 matches SEQ but BATCH-2 diverges at frame {first_feat_div_b2}.")
+        print(f"          The bug is specifically caused by processing N=2 sequences together.")
+        print(f"          Likely cause: shared mutable state (mask cache, entropy coder internal")
+        print(f"          buffer, or CUDA stream) is being contaminated across the two slots.")
+        diagnosed = True
+
+    if first_bits_div_b2 is not None and first_feat_div_b2 is None and first_feat_div_b1 is None:
+        print(f"[BITS-B2] BATCH-2 bitstreams diverge at frame {first_bits_div_b2} but features match.")
+        print(f"          Same entropy coder state issue as BITS-B1 but only manifests at B=2.")
+        diagnosed = True
+
+    # Check materialised features — this fires if the ref_frames state is wrong.
+    if first_mat_div_b1 is not None or first_mat_div_b2 is not None:
+        b1_f = first_mat_div_b1 or 'never'
+        b2_f = first_mat_div_b2 or 'never'
+        print(f"[MAT DIV] Materialised features diverge (B1 at frame {b1_f}, B2 at frame {b2_f}).")
+        print(f"          The reference features stored in ref_frames between frames are wrong.")
+        print(f"          Check how ref_frames[i].feature is set after each compress_batch() call")
+        print(f"          and compare with how compress() updates self.dpb.")
+        diagnosed = True
+
+    # Cumulative drift without per-frame threshold violations.
+    if not diagnosed and (cum_drift_b1 > 0 or cum_drift_b2 > 0):
+        print(f"[DRIFT]   No per-frame differences exceed the {THRESH:.0e} threshold, but")
+        print(f"          cumulative drift is non-zero (B1={cum_drift_b1:.6f}, B2={cum_drift_b2:.6f}).")
+        print(f"          Small float16 rounding differences are accumulating over time.")
+        print(f"          This could explain gradual PSNR degradation.  Consider whether")
+        print(f"          the half-precision arithmetic in compress_batch() matches compress().")
+        diagnosed = True
+
+    if not diagnosed:
+        print("[PASS]    All encoding paths match perfectly across all frames.")
+        print("          The PSNR bug is NOT in the encode path.")
+        print("          Next step: investigate the DECODE path.")
+        print("          The most likely candidate is decompress() reading stale DPB state,")
+        print("          specifically the reset_ref_feature() interaction at reset-interval frames.")
+        print("          The decoder in test_video_batch.py:decode_sequence() should be audited.")
 
 
 if __name__ == "__main__":
