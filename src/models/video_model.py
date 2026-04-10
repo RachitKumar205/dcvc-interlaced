@@ -388,6 +388,21 @@ class DMC(CompressionModel):
 
         # Wait for all GPU work to finish before touching results on the CPU.
         torch.cuda.synchronize(device=device)
+
+        # DEBUG: print per-slot diffs at each stage to isolate divergence source.
+        # Only fires when N >= 2; remove once root cause is identified.
+        if N >= 2 and getattr(self, '_debug_batch_diff', False):
+            def _diff(a, b, name):
+                d = (a.float() - b.float()).abs()
+                print(f"  DIFF {name:30s}  max={d.max().item():.4e}  mean={d.mean().item():.4e}")
+            print(f"[compress_batch DEBUG] N={N}")
+            _diff(ctx[0:1],        ctx[1:2],        "ctx[0] vs ctx[1]")
+            _diff(ctx_t[0:1],      ctx_t[1:2],      "ctx_t[0] vs ctx_t[1]")
+            _diff(y[0:1],          y[1:2],          "y[0] vs y[1]")
+            _diff(z_hat[0:1],      z_hat[1:2],      "z_hat[0] vs z_hat[1]")
+            _diff(params[0:1],     params[1:2],     "params[0] vs params[1]")
+            _diff(y_hat[0:1],      y_hat[1:2],      "y_hat[0] vs y_hat[1]")
+            _diff(features_out[0:1], features_out[1:2], "features_out[0] vs [1]")
         t_gpu_end = time.time()
 
         t_cpu_start = time.time()

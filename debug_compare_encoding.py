@@ -390,7 +390,9 @@ def main():
             # ------------------------------------------------------------------
             x_batch  = torch.cat([x, x],             dim=0)
             mat_b2   = torch.cat([mat_b2_0, mat_b2_1], dim=0)
+            p_frame_net._debug_batch_diff = (frame_idx == 1)  # print only on first P-frame
             streams_b2, feats_b2, _ = p_frame_net.compress_batch(x_batch, qp_p, mat_b2)
+            p_frame_net._debug_batch_diff = False
             bits_b2_0 = streams_b2[0]
             bits_b2_1 = streams_b2[1]
             feat_b2_0 = feats_b2[0:1].clone()
