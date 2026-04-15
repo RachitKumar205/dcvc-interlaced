@@ -99,6 +99,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from src.models.image_model import DMCI
 from src.models.video_model import DMC, RefFrame
+from src.layers.cuda_inference import round_and_to_int8
 from src.utils.common import get_state_dict, set_torch_env
 from src.utils.transforms import ycbcr420_to_444_np
 from src.utils.video_reader import YUV420Reader
@@ -144,6 +145,104 @@ def bytes_match(a, b):
     return a == b
 
 
+def compress_prior_2x_trace(model, y, common_params):
+    """
+    Mirror CompressionModel.compress_prior_2x() but keep all relevant
+    intermediates so we can identify the first divergence inside the prior path.
+    """
+    y_scaled, q_dec, scales_0, means_0 = \
+        model.separate_prior_for_video_encoding(common_params.clone(), y.clone())
+    dtype = y_scaled.dtype
+    device = y_scaled.device
+    B, C, H, W = y_scaled.size()
+    mask_0, mask_1 = model.get_mask_2x(B, C, H, W, dtype, device)
+
+    _, y_q_0, y_hat_0, s_hat_0 = model.process_with_mask(y_scaled, scales_0, means_0, mask_0)
+    cat_params = torch.cat((y_hat_0, common_params), dim=1)
+    scales_1, means_1 = model.y_spatial_prior(cat_params).chunk(2, 1)
+    _, y_q_1, y_hat_1, s_hat_1 = model.process_with_mask(y_scaled, scales_1, means_1, mask_1)
+    y_hat = (y_hat_0 + y_hat_1) * q_dec
+
+    return {
+        'prior_y_scaled': y_scaled,
+        'prior_q_dec': q_dec,
+        'prior_scales_0': scales_0,
+        'prior_means_0': means_0,
+        'prior_y_q_0': y_q_0,
+        'prior_y_hat_0': y_hat_0,
+        'prior_s_hat_0': s_hat_0,
+        'prior_cat_params': cat_params,
+        'prior_scales_1': scales_1,
+        'prior_means_1': means_1,
+        'prior_y_q_1': y_q_1,
+        'prior_y_hat_1': y_hat_1,
+        'prior_s_hat_1': s_hat_1,
+        'prior_y_hat': y_hat,
+    }
+
+
+def forward_trace(model, x, qp, ref_feature):
+    """
+    Run the forward part of compress() without touching DPB or entropy coder.
+    Returns intermediate tensors so we can compare SEQ/B1/B2 stage-by-stage.
+    """
+    q_encoder = model.q_encoder[qp:qp+1, :, :, :]
+    q_decoder = model.q_decoder[qp:qp+1, :, :, :]
+    q_feature = model.q_feature[qp:qp+1, :, :, :]
+
+    ctx, ctx_t = model.feature_extractor(ref_feature, q_feature)
+    y = model.encoder(x, ctx, q_encoder)
+    z = model.hyper_encoder(model.pad_for_y(y))
+    z_hat, _ = round_and_to_int8(z)
+    params = model.res_prior_param_decoder(z_hat, ctx_t)
+    prior_trace = compress_prior_2x_trace(model, y, params)
+    y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+        model.compress_prior_2x(y, params, model.y_spatial_prior)
+    features_out = model.decoder(y_hat, ctx, q_decoder)
+
+    trace = {
+        'ctx': ctx,
+        'ctx_t': ctx_t,
+        'y': y,
+        'z_hat': z_hat,
+        'params': params,
+        'y_q_w_0': y_q_w_0,
+        'y_q_w_1': y_q_w_1,
+        's_w_0': s_w_0,
+        's_w_1': s_w_1,
+        'y_hat': y_hat,
+        'features_out': features_out,
+    }
+    trace.update(prior_trace)
+    return trace
+
+
+def slice_trace(trace, idx):
+    return {k: v[idx:idx+1] for k, v in trace.items()}
+
+
+def print_stage_diffs(label_a, trace_a, label_b, trace_b):
+    print(f"[TRACE] {label_a} vs {label_b}")
+    first_diff = None
+    for name in (
+        'ctx', 'ctx_t', 'y', 'z_hat', 'params',
+        'prior_y_scaled', 'prior_q_dec',
+        'prior_scales_0', 'prior_means_0', 'prior_y_q_0', 'prior_y_hat_0', 'prior_s_hat_0',
+        'prior_cat_params',
+        'prior_scales_1', 'prior_means_1', 'prior_y_q_1', 'prior_y_hat_1', 'prior_s_hat_1',
+        'prior_y_hat',
+        'y_q_w_0', 'y_q_w_1', 's_w_0', 's_w_1', 'y_hat', 'features_out'
+    ):
+        dmax, dmean = tensor_diff_f32(trace_a[name], trace_b[name])
+        print(f"  {name:14s} max={dmax:.4e}  mean={dmean:.4e}")
+        if first_diff is None and dmax > 1e-3:
+            first_diff = name
+    if first_diff is None:
+        print("  first_diff      none above threshold")
+    else:
+        print(f"  first_diff      {first_diff}")
+
+
 # ---------------------------------------------------------------------------
 # Main diagnostic
 # ---------------------------------------------------------------------------
@@ -160,6 +259,8 @@ def main():
     parser.add_argument('--num_frames',      type=int, default=100)
     parser.add_argument('--reset_interval',  type=int, default=32,
                         help="Must match --reset_interval used in test_video_batch.py (default: 32)")
+    parser.add_argument('--trace_frame',     type=int, default=1,
+                        help="P-frame index at which to print detailed SEQ/B1/B2 stage diffs")
     args = parser.parse_args()
 
     set_torch_env()
@@ -399,6 +500,17 @@ def main():
             ref_b2_1.feature = feat_b2_1
             ref_b2_1.frame   = None
             last_qp_b2       = qp_p
+
+            if frame_idx == args.trace_frame:
+                trace_seq = forward_trace(p_frame_net, x, qp_p, mat_seq)
+                trace_b1 = forward_trace(p_frame_net, x, qp_p, mat_b1)
+                trace_b2 = forward_trace(p_frame_net, x_batch, qp_p, mat_b2)
+
+                print_stage_diffs("SEQ", trace_seq, "B1", trace_b1)
+                print_stage_diffs("SEQ", trace_seq, "B2[0]", slice_trace(trace_b2, 0))
+                print_stage_diffs("B1", trace_b1, "B2[0]", slice_trace(trace_b2, 0))
+                print_stage_diffs("B2[0]", slice_trace(trace_b2, 0),
+                                  "B2[1]", slice_trace(trace_b2, 1))
 
             # ------------------------------------------------------------------
             # COMPARE RESULTS
