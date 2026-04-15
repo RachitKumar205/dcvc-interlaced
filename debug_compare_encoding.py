@@ -197,7 +197,7 @@ def forward_trace(model, x, qp, ref_feature):
     q_decoder = model.q_decoder[qp:qp+1, :, :, :]
     q_feature = model.q_feature[qp:qp+1, :, :, :]
 
-    ctx, ctx_t = model.feature_extractor(ref_feature, q_feature)
+    ctx, ctx_t = model.extract_context(ref_feature, q_feature)
     y = model.encoder(x, ctx, q_encoder)
     z = model.hyper_encoder(model.pad_for_y(y))
     z_hat, _ = round_and_to_int8(z)

@@ -1,6 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -276,6 +278,33 @@ class DMC(CompressionModel):
             return self.feature_adaptor_i(F.pixel_unshuffle(self.dpb[0].frame, 8))
         return self.feature_adaptor_p(self.dpb[0].feature)
 
+    @staticmethod
+    def _feature_extractor_guard(x):
+        # cuDNN fp16 kernels on the PyTorch fallback path can produce different
+        # results for the same sample at B=1 vs B=2. The decoder always runs
+        # with batch size 1, so we force the context path onto the batch-stable
+        # non-cuDNN implementation for all CUDA fp16 calls.
+        if (not CUSTOMIZED_CUDA_INFERENCE) and x.is_cuda and x.dtype == torch.float16:
+            return torch.backends.cudnn.flags(
+                enabled=False,
+                benchmark=False,
+                deterministic=True,
+                allow_tf32=False,
+            )
+        return nullcontext()
+
+    def extract_context(self, feature, q_feature):
+        with self._feature_extractor_guard(feature):
+            return self.feature_extractor(feature, q_feature)
+
+    def extract_context_part1(self, feature, q_feature):
+        with self._feature_extractor_guard(feature):
+            return self.feature_extractor.forward_part1(feature, q_feature)
+
+    def extract_context_part2(self, c1):
+        with self._feature_extractor_guard(c1):
+            return self.feature_extractor.forward_part2(c1)
+
     def res_prior_param_decoder(self, z_hat, ctx_t):
         hierarchical_params = self.hyper_decoder(z_hat)
         temporal_params = self.temporal_prior_encoder(ctx_t)
@@ -305,7 +334,7 @@ class DMC(CompressionModel):
         q_feature = self.q_feature[qp:qp+1, :, :, :]
 
         feature = self.apply_feature_adaptor()
-        ctx, ctx_t = self.feature_extractor(feature, q_feature)
+        ctx, ctx_t = self.extract_context(feature, q_feature)
         y = self.encoder(x, ctx, q_encoder)
 
         hyper_inp = self.pad_for_y(y)
@@ -383,7 +412,7 @@ class DMC(CompressionModel):
         # ------------------------------------------------------------------
         # Phase 1: B=N GPU forward pass
         # ------------------------------------------------------------------
-        ctx, ctx_t = self.feature_extractor(ref_features, q_feature)
+        ctx, ctx_t = self.extract_context(ref_features, q_feature)
         y = self.encoder(x_batch, ctx, q_encoder)
 
         z = self.hyper_encoder(self.pad_for_y(y))
@@ -466,13 +495,13 @@ class DMC(CompressionModel):
         self.bit_estimator_z.decode_z(z_size, qp)
 
         feature = self.apply_feature_adaptor()
-        c1, ctx_t = self.feature_extractor.forward_part1(feature, q_feature)
+        c1, ctx_t = self.extract_context_part1(feature, q_feature)
 
         z_hat = self.bit_estimator_z.get_z(z_size, device, dtype)
         params = self.res_prior_param_decoder(z_hat, ctx_t)
         infos = self.decompress_prior_2x_part1(params)
 
-        ctx = self.feature_extractor.forward_part2(c1)
+        ctx = self.extract_context_part2(c1)
 
         if device.type == "cuda":
             cuda_stream = self.get_cuda_stream(device=device, priority=-1)
