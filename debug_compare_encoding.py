@@ -355,6 +355,56 @@ def print_stage_diffs(label_a, trace_a, label_b, trace_b):
         print(f"  first_diff      {first_diff}")
 
 
+def print_encode_debug_diffs(trace_seq, seq_debug, b1_debug, b2_debug,
+                             feat_seq, feat_b1, feat_b2_0):
+    def maybe_print_block(title, pairs):
+        print(title)
+        first_diff = None
+        for name, a, b in pairs:
+            dmax, dmean = tensor_diff_f32(a, b)
+            print(f"  {name:22s} max={dmax:.4e}  mean={dmean:.4e}")
+            if first_diff is None and dmax > 1e-3:
+                first_diff = name
+        if first_diff is None:
+            print("  first_diff               none above threshold")
+        else:
+            print(f"  first_diff               {first_diff}")
+
+    maybe_print_block(
+        "[ENCODE DEBUG] trace vs real compress() / compress_batch() outputs",
+        [
+            ("seq_pre_vs_trace", seq_debug['feature_pre_entropy'], trace_seq['features_out']),
+            ("seq_post_vs_pre", seq_debug['feature_post_entropy'], seq_debug['feature_pre_entropy']),
+            ("b1_pre_vs_trace", b1_debug['features_pre_entropy'][0:1], trace_seq['features_out']),
+            ("b1_post_vs_pre", b1_debug['features_post_entropy'][0:1], b1_debug['features_pre_entropy'][0:1]),
+            ("b2_pre_vs_trace", b2_debug['features_pre_entropy'][0:1], trace_seq['features_out']),
+            ("b2_post_vs_pre", b2_debug['features_post_entropy'][0:1], b2_debug['features_pre_entropy'][0:1]),
+            ("seq_pre_vs_b1_pre", seq_debug['feature_pre_entropy'], b1_debug['features_pre_entropy'][0:1]),
+            ("seq_pre_vs_b2_pre", seq_debug['feature_pre_entropy'], b2_debug['features_pre_entropy'][0:1]),
+            ("seq_post_vs_feat_seq", seq_debug['feature_post_entropy'], feat_seq),
+            ("b1_post_vs_feat_b1", b1_debug['features_post_entropy'][0:1], feat_b1),
+            ("b2_post_vs_feat_b2", b2_debug['features_post_entropy'][0:1], feat_b2_0),
+            ("feat_seq_vs_feat_b1", feat_seq, feat_b1),
+            ("feat_seq_vs_feat_b2", feat_seq, feat_b2_0),
+        ],
+    )
+    maybe_print_block(
+        "[ENCODE DEBUG] scale tensors before/after build_indexes_encoder",
+        [
+            ("seq_s_w_0_mutation", seq_debug['s_w_0_before'], seq_debug['s_w_0_after']),
+            ("seq_s_w_1_mutation", seq_debug['s_w_1_before'], seq_debug['s_w_1_after']),
+            ("b1_s_w_0_mutation", b1_debug['slot_states'][0]['s_w_0_before'],
+             b1_debug['slot_states'][0]['s_w_0_after']),
+            ("b1_s_w_1_mutation", b1_debug['slot_states'][0]['s_w_1_before'],
+             b1_debug['slot_states'][0]['s_w_1_after']),
+            ("b2_s0_s_w_0_mutation", b2_debug['slot_states'][0]['s_w_0_before'],
+             b2_debug['slot_states'][0]['s_w_0_after']),
+            ("b2_s0_s_w_1_mutation", b2_debug['slot_states'][0]['s_w_1_before'],
+             b2_debug['slot_states'][0]['s_w_1_after']),
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main diagnostic
 # ---------------------------------------------------------------------------
@@ -561,11 +611,13 @@ def main():
             # then at the end calls self.add_ref_frame() → writes dpb[0].
             # We read the decoder output feature back from dpb[0] after the call.
             # ------------------------------------------------------------------
+            p_frame_net._debug_capture_encode_state = (frame_idx == args.trace_frame)
             p_frame_net.clear_dpb()
             p_frame_net.add_ref_frame(ref_seq.feature, ref_seq.frame)
             enc_seq  = p_frame_net.compress(x, qp_p)
             bits_seq = enc_seq['bit_stream']
             feat_seq = p_frame_net.dpb[0].feature.clone()
+            seq_debug = getattr(p_frame_net, '_last_compress_debug', None)
 
             ref_seq.feature = feat_seq
             ref_seq.frame   = None
@@ -583,6 +635,7 @@ def main():
             streams_b1, feats_b1, _ = p_frame_net.compress_batch(x, qp_p, mat_b1)
             bits_b1  = streams_b1[0]
             feat_b1  = feats_b1[0:1].clone()
+            b1_debug = getattr(p_frame_net, '_last_compress_batch_debug', None)
 
             ref_b1.feature = feat_b1
             ref_b1.frame   = None
@@ -602,10 +655,12 @@ def main():
             p_frame_net._debug_batch_diff = (frame_idx == 1)  # print only on first P-frame
             streams_b2, feats_b2, _ = p_frame_net.compress_batch(x_batch, qp_p, mat_b2)
             p_frame_net._debug_batch_diff = False
+            p_frame_net._debug_capture_encode_state = False
             bits_b2_0 = streams_b2[0]
             bits_b2_1 = streams_b2[1]
             feat_b2_0 = feats_b2[0:1].clone()
             feat_b2_1 = feats_b2[1:2].clone()
+            b2_debug = getattr(p_frame_net, '_last_compress_batch_debug', None)
 
             ref_b2_0.feature = feat_b2_0
             ref_b2_0.frame   = None
@@ -627,6 +682,14 @@ def main():
                 print_stage_diffs("B1", trace_b1, "B2[0]", slice_trace(trace_b2, 0))
                 print_stage_diffs("B2[0]", slice_trace(trace_b2, 0),
                                   "B2[1]", slice_trace(trace_b2, 1))
+                if seq_debug is not None and b1_debug is not None and b2_debug is not None:
+                    print_named_diff("mat_seq vs seq_input",
+                                     mat_seq,
+                                     seq_debug['input_feature'])
+                    print_encode_debug_diffs(
+                        trace_seq, seq_debug, b1_debug, b2_debug,
+                        feat_seq, feat_b1, feat_b2_0,
+                    )
                 print_feature_extractor_ablation(p_frame_net, mat_seq, qp_p)
 
             # ------------------------------------------------------------------

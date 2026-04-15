@@ -335,6 +335,8 @@ class DMC(CompressionModel):
 
         with self._fallback_conv_guard(x):
             feature = self.apply_feature_adaptor()
+            debug_input_feature = feature.contiguous().clone() \
+                if getattr(self, '_debug_capture_encode_state', False) else None
             ctx, ctx_t = self.extract_context(feature, q_feature)
             y = self.encoder(x, ctx, q_encoder)
 
@@ -348,11 +350,17 @@ class DMC(CompressionModel):
 
             feature = self.decoder(y_hat, ctx, q_decoder)
         feature_out = feature.contiguous().clone()
+        debug_feature_pre_entropy = feature_out.contiguous().clone() \
+            if getattr(self, '_debug_capture_encode_state', False) else None
         curr_z = z_hat_write.contiguous().clone()
         curr_y_q_w_0 = y_q_w_0.contiguous().clone()
         curr_y_q_w_1 = y_q_w_1.contiguous().clone()
         curr_s_w_0 = s_w_0.contiguous().clone()
         curr_s_w_1 = s_w_1.contiguous().clone()
+        debug_s_w_0_before = curr_s_w_0.contiguous().clone() \
+            if getattr(self, '_debug_capture_encode_state', False) else None
+        debug_s_w_1_before = curr_s_w_1.contiguous().clone() \
+            if getattr(self, '_debug_capture_encode_state', False) else None
 
         entropy_coder = self.create_isolated_entropy_coder()
         entropy_coder.reset()
@@ -373,6 +381,16 @@ class DMC(CompressionModel):
         entropy_coder.flush()
 
         bit_stream = entropy_coder.get_encoded_stream()
+        if getattr(self, '_debug_capture_encode_state', False):
+            self._last_compress_debug = {
+                'input_feature': debug_input_feature,
+                'feature_pre_entropy': debug_feature_pre_entropy,
+                'feature_post_entropy': feature_out.contiguous().clone(),
+                's_w_0_before': debug_s_w_0_before,
+                's_w_1_before': debug_s_w_1_before,
+                's_w_0_after': curr_s_w_0.contiguous().clone(),
+                's_w_1_after': curr_s_w_1.contiguous().clone(),
+            }
         self.add_ref_frame(feature_out, None)
         return {
             'bit_stream': bit_stream,
@@ -424,6 +442,8 @@ class DMC(CompressionModel):
             y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
                 self.compress_prior_2x(y, params, self.y_spatial_prior)
             features_out = self.decoder(y_hat, ctx, q_decoder)   # [N, g_ch_d, H', W']
+        debug_features_pre_entropy = features_out.contiguous().clone() \
+            if getattr(self, '_debug_capture_encode_state', False) else None
 
         # Wait for all GPU work to finish before touching results on the CPU.
         if device.type == "cuda":
@@ -451,12 +471,18 @@ class DMC(CompressionModel):
         # shared entropy coder — reset() clears symbols but keeps CDFs).
         # ------------------------------------------------------------------
         bit_streams = []
+        debug_slot_states = [] if getattr(self, '_debug_capture_encode_state', False) else None
         for i in range(N):
             curr_z = z_hat_write[i:i+1].contiguous().clone()
             curr_y_q_w_0 = y_q_w_0[i:i+1].contiguous().clone()
             curr_y_q_w_1 = y_q_w_1[i:i+1].contiguous().clone()
             curr_s_w_0 = s_w_0[i:i+1].contiguous().clone()
             curr_s_w_1 = s_w_1[i:i+1].contiguous().clone()
+            if debug_slot_states is not None:
+                debug_slot_states.append({
+                    's_w_0_before': curr_s_w_0.contiguous().clone(),
+                    's_w_1_before': curr_s_w_1.contiguous().clone(),
+                })
 
             entropy_coder = self.create_isolated_entropy_coder()
             entropy_coder.reset()
@@ -476,12 +502,21 @@ class DMC(CompressionModel):
             )
             entropy_coder.flush()
             bit_streams.append(entropy_coder.get_encoded_stream())
+            if debug_slot_states is not None:
+                debug_slot_states[-1]['s_w_0_after'] = curr_s_w_0.contiguous().clone()
+                debug_slot_states[-1]['s_w_1_after'] = curr_s_w_1.contiguous().clone()
 
         t_cpu_end = time.time()
         timing = {
             'gpu_forward': t_gpu_end - t_gpu_start,
             'cpu_entropy': t_cpu_end - t_cpu_start
         }
+        if getattr(self, '_debug_capture_encode_state', False):
+            self._last_compress_batch_debug = {
+                'features_pre_entropy': debug_features_pre_entropy,
+                'features_post_entropy': features_out.contiguous().clone(),
+                'slot_states': debug_slot_states,
+            }
 
         return bit_streams, features_out, timing
 
