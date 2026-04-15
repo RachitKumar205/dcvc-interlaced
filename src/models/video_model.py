@@ -279,11 +279,11 @@ class DMC(CompressionModel):
         return self.feature_adaptor_p(self.dpb[0].feature)
 
     @staticmethod
-    def _feature_extractor_guard(x):
-        # cuDNN fp16 kernels on the PyTorch fallback path can produce different
-        # results for the same sample at B=1 vs B=2. The decoder always runs
-        # with batch size 1, so we force the context path onto the batch-stable
-        # non-cuDNN implementation for all CUDA fp16 calls.
+    def _fallback_conv_guard(x):
+        # On the PyTorch fallback path (no customized CUDA inference), cuDNN
+        # fp16 kernels can produce different outputs for the same sample at
+        # B=1 vs B=2. Guard the whole learned P-frame forward so SEQ/B1/B2 all
+        # use the same batch-stable kernels.
         if (not CUSTOMIZED_CUDA_INFERENCE) and x.is_cuda and x.dtype == torch.float16:
             return torch.backends.cudnn.flags(
                 enabled=False,
@@ -294,15 +294,15 @@ class DMC(CompressionModel):
         return nullcontext()
 
     def extract_context(self, feature, q_feature):
-        with self._feature_extractor_guard(feature):
+        with self._fallback_conv_guard(feature):
             return self.feature_extractor(feature, q_feature)
 
     def extract_context_part1(self, feature, q_feature):
-        with self._feature_extractor_guard(feature):
+        with self._fallback_conv_guard(feature):
             return self.feature_extractor.forward_part1(feature, q_feature)
 
     def extract_context_part2(self, c1):
-        with self._feature_extractor_guard(c1):
+        with self._fallback_conv_guard(c1):
             return self.feature_extractor.forward_part2(c1)
 
     def res_prior_param_decoder(self, z_hat, ctx_t):
@@ -333,19 +333,20 @@ class DMC(CompressionModel):
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
         q_feature = self.q_feature[qp:qp+1, :, :, :]
 
-        feature = self.apply_feature_adaptor()
-        ctx, ctx_t = self.extract_context(feature, q_feature)
-        y = self.encoder(x, ctx, q_encoder)
+        with self._fallback_conv_guard(x):
+            feature = self.apply_feature_adaptor()
+            ctx, ctx_t = self.extract_context(feature, q_feature)
+            y = self.encoder(x, ctx, q_encoder)
 
-        hyper_inp = self.pad_for_y(y)
+            hyper_inp = self.pad_for_y(y)
 
-        z = self.hyper_encoder(hyper_inp)
-        z_hat, z_hat_write = round_and_to_int8(z)
-        params = self.res_prior_param_decoder(z_hat, ctx_t)
-        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
-            self.compress_prior_2x(y, params, self.y_spatial_prior)
+            z = self.hyper_encoder(hyper_inp)
+            z_hat, z_hat_write = round_and_to_int8(z)
+            params = self.res_prior_param_decoder(z_hat, ctx_t)
+            y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+                self.compress_prior_2x(y, params, self.y_spatial_prior)
 
-        feature = self.decoder(y_hat, ctx, q_decoder)
+            feature = self.decoder(y_hat, ctx, q_decoder)
 
         if device.type == "cuda":
             cuda_event_z_ready = torch.cuda.Event()
@@ -412,15 +413,16 @@ class DMC(CompressionModel):
         # ------------------------------------------------------------------
         # Phase 1: B=N GPU forward pass
         # ------------------------------------------------------------------
-        ctx, ctx_t = self.extract_context(ref_features, q_feature)
-        y = self.encoder(x_batch, ctx, q_encoder)
+        with self._fallback_conv_guard(x_batch):
+            ctx, ctx_t = self.extract_context(ref_features, q_feature)
+            y = self.encoder(x_batch, ctx, q_encoder)
 
-        z = self.hyper_encoder(self.pad_for_y(y))
-        z_hat, z_hat_write = round_and_to_int8(z)
-        params = self.res_prior_param_decoder(z_hat, ctx_t)
-        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
-            self.compress_prior_2x(y, params, self.y_spatial_prior)
-        features_out = self.decoder(y_hat, ctx, q_decoder)   # [N, g_ch_d, H', W']
+            z = self.hyper_encoder(self.pad_for_y(y))
+            z_hat, z_hat_write = round_and_to_int8(z)
+            params = self.res_prior_param_decoder(z_hat, ctx_t)
+            y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+                self.compress_prior_2x(y, params, self.y_spatial_prior)
+            features_out = self.decoder(y_hat, ctx, q_decoder)   # [N, g_ch_d, H', W']
 
         # Wait for all GPU work to finish before touching results on the CPU.
         if device.type == "cuda":
@@ -494,25 +496,29 @@ class DMC(CompressionModel):
         z_size = self.get_downsampled_shape(sps['height'], sps['width'], 64)
         self.bit_estimator_z.decode_z(z_size, qp)
 
-        feature = self.apply_feature_adaptor()
-        c1, ctx_t = self.extract_context_part1(feature, q_feature)
+        with self._fallback_conv_guard(q_feature):
+            feature = self.apply_feature_adaptor()
+            c1, ctx_t = self.extract_context_part1(feature, q_feature)
 
-        z_hat = self.bit_estimator_z.get_z(z_size, device, dtype)
-        params = self.res_prior_param_decoder(z_hat, ctx_t)
-        infos = self.decompress_prior_2x_part1(params)
+            z_hat = self.bit_estimator_z.get_z(z_size, device, dtype)
+            params = self.res_prior_param_decoder(z_hat, ctx_t)
+            infos = self.decompress_prior_2x_part1(params)
 
-        ctx = self.extract_context_part2(c1)
+            ctx = self.extract_context_part2(c1)
 
         if device.type == "cuda":
             cuda_stream = self.get_cuda_stream(device=device, priority=-1)
             with torch.cuda.stream(cuda_stream):
-                y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
-                cuda_event = torch.cuda.Event()
-                cuda_event.record()
+                with self._fallback_conv_guard(q_feature):
+                    y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
+                    cuda_event = torch.cuda.Event()
+                    cuda_event.record()
             cuda_event.wait()
         else:
-            y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
-        x_hat, feature = self.get_recon_and_feature(y_hat, ctx, q_decoder, q_recon)
+            with self._fallback_conv_guard(q_feature):
+                y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
+        with self._fallback_conv_guard(q_feature):
+            x_hat, feature = self.get_recon_and_feature(y_hat, ctx, q_decoder, q_recon)
 
         self.add_ref_frame(feature, x_hat)
         return {

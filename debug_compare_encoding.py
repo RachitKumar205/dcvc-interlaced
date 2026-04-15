@@ -197,15 +197,16 @@ def forward_trace(model, x, qp, ref_feature):
     q_decoder = model.q_decoder[qp:qp+1, :, :, :]
     q_feature = model.q_feature[qp:qp+1, :, :, :]
 
-    ctx, ctx_t = model.extract_context(ref_feature, q_feature)
-    y = model.encoder(x, ctx, q_encoder)
-    z = model.hyper_encoder(model.pad_for_y(y))
-    z_hat, _ = round_and_to_int8(z)
-    params = model.res_prior_param_decoder(z_hat, ctx_t)
-    prior_trace = compress_prior_2x_trace(model, y, params)
-    y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
-        model.compress_prior_2x(y, params, model.y_spatial_prior)
-    features_out = model.decoder(y_hat, ctx, q_decoder)
+    with model._fallback_conv_guard(x):
+        ctx, ctx_t = model.extract_context(ref_feature, q_feature)
+        y = model.encoder(x, ctx, q_encoder)
+        z = model.hyper_encoder(model.pad_for_y(y))
+        z_hat, _ = round_and_to_int8(z)
+        params = model.res_prior_param_decoder(z_hat, ctx_t)
+        prior_trace = compress_prior_2x_trace(model, y, params)
+        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+            model.compress_prior_2x(y, params, model.y_spatial_prior)
+        features_out = model.decoder(y_hat, ctx, q_decoder)
 
     trace = {
         'ctx': ctx,
