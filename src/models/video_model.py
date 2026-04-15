@@ -347,32 +347,33 @@ class DMC(CompressionModel):
                 self.compress_prior_2x(y, params, self.y_spatial_prior)
 
             feature = self.decoder(y_hat, ctx, q_decoder)
+        feature_out = feature.contiguous().clone()
+        curr_z = z_hat_write.contiguous().clone()
+        curr_y_q_w_0 = y_q_w_0.contiguous().clone()
+        curr_y_q_w_1 = y_q_w_1.contiguous().clone()
+        curr_s_w_0 = s_w_0.contiguous().clone()
+        curr_s_w_1 = s_w_1.contiguous().clone()
 
-        if device.type == "cuda":
-            cuda_event_z_ready = torch.cuda.Event()
-            cuda_event_z_ready.record()
-            cuda_event_y_ready = torch.cuda.Event()
-            cuda_event_y_ready.record()
+        entropy_coder = self.create_isolated_entropy_coder()
+        entropy_coder.reset()
+        entropy_coder.encode_z(
+            curr_z.reshape(-1),
+            self.bit_estimator_z.cdf_group_index,
+            qp * self.bit_estimator_z.channel,
+            curr_z.shape[-2] * curr_z.shape[-1],
+        )
+        entropy_coder.encode_y(
+            self.gaussian_encoder.build_indexes_encoder(curr_y_q_w_0, curr_s_w_0),
+            self.gaussian_encoder.cdf_group_index,
+        )
+        entropy_coder.encode_y(
+            self.gaussian_encoder.build_indexes_encoder(curr_y_q_w_1, curr_s_w_1),
+            self.gaussian_encoder.cdf_group_index,
+        )
+        entropy_coder.flush()
 
-            cuda_stream = self.get_cuda_stream(device=device, priority=-1)
-            with torch.cuda.stream(cuda_stream):
-                self.entropy_coder.reset()
-                cuda_event_z_ready.wait()
-                self.bit_estimator_z.encode_z(z_hat_write, qp)
-                cuda_event_y_ready.wait()
-                self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
-                self.gaussian_encoder.encode_y(y_q_w_1, s_w_1)
-                self.entropy_coder.flush()
-            torch.cuda.synchronize(device=device)
-        else:
-            self.entropy_coder.reset()
-            self.bit_estimator_z.encode_z(z_hat_write, qp)
-            self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
-            self.gaussian_encoder.encode_y(y_q_w_1, s_w_1)
-            self.entropy_coder.flush()
-
-        bit_stream = self.entropy_coder.get_encoded_stream()
-        self.add_ref_frame(feature, None)
+        bit_stream = entropy_coder.get_encoded_stream()
+        self.add_ref_frame(feature_out, None)
         return {
             'bit_stream': bit_stream,
         }
