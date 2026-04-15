@@ -175,8 +175,11 @@ def materialise_feature(p_frame_net, ref_frame):
                         → feature_adaptor_p.
     """
     if ref_frame.feature is not None:
-        return p_frame_net.feature_adaptor_p(ref_frame.feature)
-    return p_frame_net.feature_adaptor_i(F.pixel_unshuffle(ref_frame.frame, 8))
+        with p_frame_net._fallback_conv_guard(ref_frame.feature):
+            return p_frame_net.feature_adaptor_p(ref_frame.feature)
+    ref = F.pixel_unshuffle(ref_frame.frame, 8)
+    with p_frame_net._fallback_conv_guard(ref):
+        return p_frame_net.feature_adaptor_i(ref)
 
 
 # ---------------------------------------------------------------------------

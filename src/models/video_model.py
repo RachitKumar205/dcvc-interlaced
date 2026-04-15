@@ -275,8 +275,11 @@ class DMC(CompressionModel):
 
     def apply_feature_adaptor(self):
         if self.dpb[0].feature is None:
-            return self.feature_adaptor_i(F.pixel_unshuffle(self.dpb[0].frame, 8))
-        return self.feature_adaptor_p(self.dpb[0].feature)
+            ref = F.pixel_unshuffle(self.dpb[0].frame, 8)
+            with self._fallback_conv_guard(ref):
+                return self.feature_adaptor_i(ref)
+        with self._fallback_conv_guard(self.dpb[0].feature):
+            return self.feature_adaptor_p(self.dpb[0].feature)
 
     @staticmethod
     def _fallback_conv_guard(x):
@@ -322,7 +325,10 @@ class DMC(CompressionModel):
     def prepare_feature_adaptor_i(self, last_qp):
         if self.dpb[0].frame is None:
             q_recon = self.q_recon[last_qp:last_qp+1, :, :, :]
-            self.dpb[0].frame = self.recon_generation_net(self.dpb[0].feature, q_recon).clamp_(0, 1)
+            with self._fallback_conv_guard(self.dpb[0].feature):
+                self.dpb[0].frame = self.recon_generation_net(
+                    self.dpb[0].feature, q_recon
+                ).clamp_(0, 1)
             self.reset_ref_feature()
 
     def compress(self, x, qp):
