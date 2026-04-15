@@ -87,6 +87,7 @@ IMPORTANT: --reset_interval must match the value used in test_video_batch.py
 """
 
 import argparse
+import copy
 import io
 import os
 import sys
@@ -139,6 +140,12 @@ def tensor_diff_f32(a, b):
     """
     d = (a.float() - b.float()).abs()
     return d.max().item(), d.mean().item()
+
+
+def print_named_diff(name, a, b, indent="  "):
+    dmax, dmean = tensor_diff_f32(a, b)
+    print(f"{indent}{name:18s} max={dmax:.4e}  mean={dmean:.4e}")
+    return dmax, dmean
 
 
 def bytes_match(a, b):
@@ -215,6 +222,110 @@ def forward_trace(model, x, qp, ref_feature):
     }
     trace.update(prior_trace)
     return trace
+
+
+def feature_extractor_trace(feature_extractor, ref_feature, q_feature):
+    """
+    Trace FeatureExtractor block-by-block so we can see whether the first
+    divergence appears in conv1[0], conv1[1], or only later in conv2.
+    """
+    block_10 = feature_extractor.conv1[0](ref_feature)
+    block_11 = feature_extractor.conv1[1](block_10)
+    ctx_t = block_11 * q_feature
+
+    block_20 = feature_extractor.conv2[0](block_11)
+    block_21 = feature_extractor.conv2[1](block_20)
+    block_22 = feature_extractor.conv2[2](block_21)
+    block_23 = feature_extractor.conv2[3](block_22)
+
+    return {
+        'ref_feature': ref_feature,
+        'fe_conv1_0': block_10,
+        'fe_conv1_1': block_11,
+        'ctx_t': ctx_t,
+        'fe_conv2_0': block_20,
+        'fe_conv2_1': block_21,
+        'fe_conv2_2': block_22,
+        'fe_conv2_3': block_23,
+        'ctx': block_23,
+    }
+
+
+def print_feature_extractor_ablation(model, ref_feature, qp):
+    """
+    Compare FeatureExtractor(B=1) against FeatureExtractor(B=2) where the same
+    sample is repeated twice. Then rerun the same test with cuDNN disabled and
+    with the subgraph upcast to float32.
+    """
+    single_ref = ref_feature[0:1].contiguous()
+    pair_ref = torch.cat([single_ref, single_ref], dim=0)
+    q_feature = model.q_feature[qp:qp+1, :, :, :]
+
+    def run_trace(feature_extractor, one_ref, two_ref, qf):
+        trace_one = feature_extractor_trace(feature_extractor, one_ref, qf)
+        trace_two = feature_extractor_trace(feature_extractor, two_ref, qf)
+        return trace_one, slice_trace(trace_two, 0)
+
+    def print_ablation(label, trace_one, trace_two):
+        print(f"[ABLATION] {label}")
+        first_diff = None
+        for name in (
+            'ref_feature',
+            'fe_conv1_0',
+            'fe_conv1_1',
+            'ctx_t',
+            'fe_conv2_0',
+            'fe_conv2_1',
+            'fe_conv2_2',
+            'fe_conv2_3',
+            'ctx',
+        ):
+            dmax, _ = print_named_diff(name, trace_one[name], trace_two[name])
+            if first_diff is None and dmax > 1e-3:
+                first_diff = name
+        if first_diff is None:
+            print("  first_diff          none above threshold")
+        else:
+            print(f"  first_diff          {first_diff}")
+
+    trace_one, trace_two = run_trace(model.feature_extractor, single_ref, pair_ref, q_feature)
+    print_ablation("feature_extractor half, current backend", trace_one, trace_two)
+
+    cudnn_enabled = torch.backends.cudnn.enabled
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cudnn.enabled = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        trace_one, trace_two = run_trace(model.feature_extractor, single_ref, pair_ref, q_feature)
+    finally:
+        torch.backends.cudnn.enabled = cudnn_enabled
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+    print_ablation("feature_extractor half, cuDNN disabled", trace_one, trace_two)
+
+    feature_extractor_fp32 = copy.deepcopy(model.feature_extractor).float().to(single_ref.device).eval()
+    single_ref_fp32 = single_ref.float()
+    pair_ref_fp32 = pair_ref.float()
+    q_feature_fp32 = q_feature.float()
+    cudnn_enabled = torch.backends.cudnn.enabled
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        trace_one, trace_two = run_trace(
+            feature_extractor_fp32,
+            single_ref_fp32,
+            pair_ref_fp32,
+            q_feature_fp32,
+        )
+    finally:
+        torch.backends.cudnn.enabled = cudnn_enabled
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+    print_ablation("feature_extractor float32", trace_one, trace_two)
 
 
 def slice_trace(trace, idx):
@@ -502,6 +613,10 @@ def main():
             last_qp_b2       = qp_p
 
             if frame_idx == args.trace_frame:
+                print("[TRACE] materialised reference feature inputs")
+                print_named_diff("SEQ vs B1", mat_seq, mat_b1)
+                print_named_diff("SEQ vs B2[0]", mat_seq, mat_b2_0)
+                print_named_diff("B2[0] vs B2[1]", mat_b2_0, mat_b2_1)
                 trace_seq = forward_trace(p_frame_net, x, qp_p, mat_seq)
                 trace_b1 = forward_trace(p_frame_net, x, qp_p, mat_b1)
                 trace_b2 = forward_trace(p_frame_net, x_batch, qp_p, mat_b2)
@@ -511,6 +626,7 @@ def main():
                 print_stage_diffs("B1", trace_b1, "B2[0]", slice_trace(trace_b2, 0))
                 print_stage_diffs("B2[0]", slice_trace(trace_b2, 0),
                                   "B2[1]", slice_trace(trace_b2, 1))
+                print_feature_extractor_ablation(p_frame_net, mat_seq, qp_p)
 
             # ------------------------------------------------------------------
             # COMPARE RESULTS
