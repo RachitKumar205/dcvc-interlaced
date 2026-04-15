@@ -368,7 +368,7 @@ def encode_batch(p_frame_net, i_frame_net, seq_args_list,
                 encode_batch.profiling_stats['count'] += 1
 
                 for batch_pos, i in enumerate(p_seqs):
-                    ref_frames[i].feature = features_out[batch_pos:batch_pos+1]
+                    ref_frames[i].feature = features_out[batch_pos:batch_pos+1].clone()
                     ref_frames[i].frame   = None
                     last_qps[i]           = curr_qp
 

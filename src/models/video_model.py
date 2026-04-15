@@ -312,29 +312,36 @@ class DMC(CompressionModel):
 
         z = self.hyper_encoder(hyper_inp)
         z_hat, z_hat_write = round_and_to_int8(z)
-        cuda_event_z_ready = torch.cuda.Event()
-        cuda_event_z_ready.record()
         params = self.res_prior_param_decoder(z_hat, ctx_t)
         y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
             self.compress_prior_2x(y, params, self.y_spatial_prior)
 
-        cuda_event_y_ready = torch.cuda.Event()
-        cuda_event_y_ready.record()
         feature = self.decoder(y_hat, ctx, q_decoder)
 
-        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
-        with torch.cuda.stream(cuda_stream):
+        if device.type == "cuda":
+            cuda_event_z_ready = torch.cuda.Event()
+            cuda_event_z_ready.record()
+            cuda_event_y_ready = torch.cuda.Event()
+            cuda_event_y_ready.record()
+
+            cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+            with torch.cuda.stream(cuda_stream):
+                self.entropy_coder.reset()
+                cuda_event_z_ready.wait()
+                self.bit_estimator_z.encode_z(z_hat_write, qp)
+                cuda_event_y_ready.wait()
+                self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
+                self.gaussian_encoder.encode_y(y_q_w_1, s_w_1)
+                self.entropy_coder.flush()
+            torch.cuda.synchronize(device=device)
+        else:
             self.entropy_coder.reset()
-            cuda_event_z_ready.wait()
             self.bit_estimator_z.encode_z(z_hat_write, qp)
-            cuda_event_y_ready.wait()
             self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
             self.gaussian_encoder.encode_y(y_q_w_1, s_w_1)
             self.entropy_coder.flush()
 
         bit_stream = self.entropy_coder.get_encoded_stream()
-
-        torch.cuda.synchronize(device=device)
         self.add_ref_frame(feature, None)
         return {
             'bit_stream': bit_stream,
@@ -387,7 +394,8 @@ class DMC(CompressionModel):
         features_out = self.decoder(y_hat, ctx, q_decoder)   # [N, g_ch_d, H', W']
 
         # Wait for all GPU work to finish before touching results on the CPU.
-        torch.cuda.synchronize(device=device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device=device)
 
         # DEBUG: print per-slot diffs at each stage to isolate divergence source.
         # Only fires when N >= 2; remove once root cause is identified.
@@ -412,12 +420,30 @@ class DMC(CompressionModel):
         # ------------------------------------------------------------------
         bit_streams = []
         for i in range(N):
-            self.entropy_coder.reset()
-            self.bit_estimator_z.encode_z(z_hat_write[i:i+1], qp)
-            self.gaussian_encoder.encode_y(y_q_w_0[i:i+1], s_w_0[i:i+1])
-            self.gaussian_encoder.encode_y(y_q_w_1[i:i+1], s_w_1[i:i+1])
-            self.entropy_coder.flush()
-            bit_streams.append(self.entropy_coder.get_encoded_stream())
+            curr_z = z_hat_write[i:i+1].contiguous().clone()
+            curr_y_q_w_0 = y_q_w_0[i:i+1].contiguous().clone()
+            curr_y_q_w_1 = y_q_w_1[i:i+1].contiguous().clone()
+            curr_s_w_0 = s_w_0[i:i+1].contiguous().clone()
+            curr_s_w_1 = s_w_1[i:i+1].contiguous().clone()
+
+            entropy_coder = self.create_isolated_entropy_coder()
+            entropy_coder.reset()
+            entropy_coder.encode_z(
+                curr_z.reshape(-1),
+                self.bit_estimator_z.cdf_group_index,
+                qp * self.bit_estimator_z.channel,
+                curr_z.shape[-2] * curr_z.shape[-1],
+            )
+            entropy_coder.encode_y(
+                self.gaussian_encoder.build_indexes_encoder(curr_y_q_w_0, curr_s_w_0),
+                self.gaussian_encoder.cdf_group_index,
+            )
+            entropy_coder.encode_y(
+                self.gaussian_encoder.build_indexes_encoder(curr_y_q_w_1, curr_s_w_1),
+                self.gaussian_encoder.cdf_group_index,
+            )
+            entropy_coder.flush()
+            bit_streams.append(entropy_coder.get_encoded_stream())
 
         t_cpu_end = time.time()
         timing = {
@@ -448,13 +474,15 @@ class DMC(CompressionModel):
 
         ctx = self.feature_extractor.forward_part2(c1)
 
-        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
-        with torch.cuda.stream(cuda_stream):
+        if device.type == "cuda":
+            cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+            with torch.cuda.stream(cuda_stream):
+                y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
+                cuda_event = torch.cuda.Event()
+                cuda_event.record()
+            cuda_event.wait()
+        else:
             y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
-            cuda_event = torch.cuda.Event()
-            cuda_event.record()
-
-        cuda_event.wait()
         x_hat, feature = self.get_recon_and_feature(y_hat, ctx, q_decoder, q_recon)
 
         self.add_ref_frame(feature, x_hat)

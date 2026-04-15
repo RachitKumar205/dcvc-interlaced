@@ -98,19 +98,15 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.models.image_model import DMCI
-from src.models.video_model import DMC
-from src.models.common_model import RefFrame
+from src.models.video_model import DMC, RefFrame
 from src.utils.common import get_state_dict, set_torch_env
-from src.utils.yuv import YUV420Reader
+from src.utils.transforms import ycbcr420_to_444_np
+from src.utils.video_reader import YUV420Reader
 
 
 # ---------------------------------------------------------------------------
 # Helpers — mirror test_video_batch.py exactly
 # ---------------------------------------------------------------------------
-
-def ycbcr420_to_444_np(y, uv):
-    return np.stack([y, uv[0], uv[1]], axis=0)
-
 
 def replicate_pad(x, pad_b, pad_r):
     if pad_b > 0 or pad_r > 0:

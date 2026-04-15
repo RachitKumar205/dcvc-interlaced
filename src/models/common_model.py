@@ -21,6 +21,7 @@ class CompressionModel(nn.Module):
 
         self.masks = {}
         self.cuda_streams = {}
+        self.use_two_entropy_coders = False
 
     def get_cuda_stream(self, device, idx=0, priority=0):
         key = f"{device}_{priority}_{idx}"
@@ -48,11 +49,25 @@ class CompressionModel(nn.Module):
 
     def update(self, force_zero_thres=None):
         self.entropy_coder = EntropyCoder()
+        self.entropy_coder.set_use_two_entropy_coders(self.use_two_entropy_coders)
         self.gaussian_encoder.update(self.entropy_coder, force_zero_thres=force_zero_thres)
         self.bit_estimator_z.update(self.entropy_coder)
 
     def set_use_two_entropy_coders(self, use_two_entropy_coders):
-        self.entropy_coder.set_use_two_entropy_coders(use_two_entropy_coders)
+        self.use_two_entropy_coders = use_two_entropy_coders
+        if self.entropy_coder is not None:
+            self.entropy_coder.set_use_two_entropy_coders(use_two_entropy_coders)
+
+    def create_isolated_entropy_coder(self):
+        coder = EntropyCoder()
+        coder.set_use_two_entropy_coders(self.use_two_entropy_coders)
+
+        gaussian_idx = coder.add_cdf(*self.gaussian_encoder.get_cdf_info())
+        bit_idx = coder.add_cdf(*self.bit_estimator_z.get_cdf_info())
+
+        assert gaussian_idx == self.gaussian_encoder.cdf_group_index
+        assert bit_idx == self.bit_estimator_z.cdf_group_index
+        return coder
 
     def pad_for_y(self, y):
         _, _, H, W = y.size()

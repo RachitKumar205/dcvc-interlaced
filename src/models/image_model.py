@@ -160,13 +160,23 @@ class DMCI(CompressionModel):
                 self.y_spatial_prior_adaptor_1, self.y_spatial_prior_adaptor_2,
                 self.y_spatial_prior_adaptor_3, self.y_spatial_prior)
 
-        cuda_event = torch.cuda.Event()
-        cuda_event.record()
         x_hat = self.dec(y_hat, curr_q_dec).clamp_(0, 1)
 
-        cuda_stream = self.get_cuda_stream(device=device, priority=-1)
-        with torch.cuda.stream(cuda_stream):
-            cuda_event.wait()
+        if device.type == "cuda":
+            cuda_event = torch.cuda.Event()
+            cuda_event.record()
+            cuda_stream = self.get_cuda_stream(device=device, priority=-1)
+            with torch.cuda.stream(cuda_stream):
+                cuda_event.wait()
+                self.entropy_coder.reset()
+                self.bit_estimator_z.encode_z(z_hat_write, qp)
+                self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
+                self.gaussian_encoder.encode_y(y_q_w_1, s_w_1)
+                self.gaussian_encoder.encode_y(y_q_w_2, s_w_2)
+                self.gaussian_encoder.encode_y(y_q_w_3, s_w_3)
+                self.entropy_coder.flush()
+            torch.cuda.synchronize(device=device)
+        else:
             self.entropy_coder.reset()
             self.bit_estimator_z.encode_z(z_hat_write, qp)
             self.gaussian_encoder.encode_y(y_q_w_0, s_w_0)
@@ -176,8 +186,6 @@ class DMCI(CompressionModel):
             self.entropy_coder.flush()
 
         bit_stream = self.entropy_coder.get_encoded_stream()
-
-        torch.cuda.synchronize(device=device)
         result = {
             "bit_stream": bit_stream,
             "x_hat": x_hat,
