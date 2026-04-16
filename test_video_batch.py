@@ -47,7 +47,7 @@ import numpy as np
 from tqdm import tqdm
 
 from src.layers.cuda_inference import replicate_pad
-from src.models.video_model import DMC, RefFrame
+from src.models.video_model import DMC, RefFrame, get_fallback_guard_config
 from src.models.image_model import DMCI
 from src.utils.common import str2bool, create_folder, generate_log_json, get_state_dict, \
     dump_json, set_torch_env
@@ -175,8 +175,11 @@ def materialise_feature(p_frame_net, ref_frame):
                         → feature_adaptor_p.
     """
     if ref_frame.feature is not None:
-        return p_frame_net.feature_adaptor_p(ref_frame.feature)
-    return p_frame_net.feature_adaptor_i(F.pixel_unshuffle(ref_frame.frame, 8))
+        with p_frame_net._fallback_conv_guard(ref_frame.feature, 'feature_adaptor'):
+            return p_frame_net.feature_adaptor_p(ref_frame.feature)
+    ref = F.pixel_unshuffle(ref_frame.frame, 8)
+    with p_frame_net._fallback_conv_guard(ref, 'feature_adaptor'):
+        return p_frame_net.feature_adaptor_i(ref)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +317,7 @@ def encode_batch(p_frame_net, i_frame_net, seq_args_list,
                                           ref_frames[i].frame)
                 encoded = p_frame_net.compress(
                     x_padded_list[active.index(i)], curr_qp)
-                ref_frames[i].feature = p_frame_net.dpb[0].feature
+                ref_frames[i].feature = p_frame_net.dpb[0].feature.contiguous().clone()
                 ref_frames[i].frame   = None
                 last_qps[i] = curr_qp
 
@@ -368,7 +371,7 @@ def encode_batch(p_frame_net, i_frame_net, seq_args_list,
                 encode_batch.profiling_stats['count'] += 1
 
                 for batch_pos, i in enumerate(p_seqs):
-                    ref_frames[i].feature = features_out[batch_pos:batch_pos+1]
+                    ref_frames[i].feature = features_out[batch_pos:batch_pos+1].contiguous().clone()
                     ref_frames[i].frame   = None
                     last_qps[i]           = curr_qp
 
@@ -712,6 +715,12 @@ def main():
 
     if args.cuda_idx is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(s) for s in args.cuda_idx)
+
+    guard_enabled, guard_stages = get_fallback_guard_config()
+    if guard_enabled:
+        print(f"[guard] fallback fp16 guard enabled (stages: {','.join(sorted(guard_stages))})")
+    else:
+        print("[guard] fallback fp16 guard disabled")
 
     with open(args.test_config) as f:
         config = json.load(f)

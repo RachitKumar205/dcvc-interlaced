@@ -1,6 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import os
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -20,6 +23,40 @@ g_ch_recon = 320
 g_ch_y = 128
 g_ch_z = 128
 g_ch_d = 256
+
+_ALL_FALLBACK_GUARD_STAGES = frozenset({
+    'feature_adaptor',
+    'feature_extractor',
+    'encoder',
+    'hyper_encoder',
+    'prior_decoder',
+    'spatial_prior',
+    'decoder',
+    'recon_generation',
+})
+
+
+def _env_flag_enabled(name, default=True):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    return raw not in ('0', 'false', 'off', 'no')
+
+
+def _get_fallback_guard_stages():
+    raw = os.environ.get('DCVC_CUDNN_FALLBACK_GUARD_STAGES', 'all').strip().lower()
+    if raw in ('', 'all'):
+        return _ALL_FALLBACK_GUARD_STAGES
+    if raw == 'none':
+        return frozenset()
+    return frozenset(part.strip() for part in raw.split(',') if part.strip())
+
+
+def get_fallback_guard_config():
+    enabled = _env_flag_enabled('DCVC_CUDNN_FALLBACK_GUARD', default=True)
+    stages = _get_fallback_guard_stages() if enabled else frozenset()
+    return enabled, stages
 
 
 class FeatureExtractor(nn.Module):
@@ -227,6 +264,7 @@ class DMC(CompressionModel):
     def __init__(self):
         super().__init__(z_channel=g_ch_z, extra_qp=extra_qp)
         self.qp_shift = qp_shift
+        self._fallback_guard_enabled, self._fallback_guard_stages = get_fallback_guard_config()
 
         self.feature_adaptor_i = DepthConvBlock(g_ch_src_d, g_ch_d)
         self.feature_adaptor_p = nn.Conv2d(g_ch_d, g_ch_d, 1)
@@ -271,29 +309,73 @@ class DMC(CompressionModel):
     def set_curr_poc(self, poc):
         self.curr_poc = poc
 
+    def is_fallback_guard_enabled(self, stage=None):
+        if not self._fallback_guard_enabled:
+            return False
+        if stage is None:
+            return True
+        return stage in self._fallback_guard_stages
+
+    def _fallback_conv_guard(self, x, stage):
+        if (
+            self.is_fallback_guard_enabled(stage)
+            and (not CUSTOMIZED_CUDA_INFERENCE)
+            and x is not None
+            and x.is_cuda
+            and x.dtype == torch.float16
+        ):
+            return torch.backends.cudnn.flags(
+                enabled=False,
+                benchmark=False,
+                deterministic=True,
+                allow_tf32=False,
+            )
+        return nullcontext()
+
     def apply_feature_adaptor(self):
         if self.dpb[0].feature is None:
-            return self.feature_adaptor_i(F.pixel_unshuffle(self.dpb[0].frame, 8))
-        return self.feature_adaptor_p(self.dpb[0].feature)
+            ref = F.pixel_unshuffle(self.dpb[0].frame, 8)
+            with self._fallback_conv_guard(ref, 'feature_adaptor'):
+                return self.feature_adaptor_i(ref)
+        with self._fallback_conv_guard(self.dpb[0].feature, 'feature_adaptor'):
+            return self.feature_adaptor_p(self.dpb[0].feature)
+
+    def extract_context(self, feature, q_feature):
+        with self._fallback_conv_guard(feature, 'feature_extractor'):
+            return self.feature_extractor(feature, q_feature)
+
+    def extract_context_part1(self, feature, q_feature):
+        with self._fallback_conv_guard(feature, 'feature_extractor'):
+            return self.feature_extractor.forward_part1(feature, q_feature)
+
+    def extract_context_part2(self, c1):
+        with self._fallback_conv_guard(c1, 'feature_extractor'):
+            return self.feature_extractor.forward_part2(c1)
 
     def res_prior_param_decoder(self, z_hat, ctx_t):
-        hierarchical_params = self.hyper_decoder(z_hat)
-        temporal_params = self.temporal_prior_encoder(ctx_t)
-        _, _, H, W = temporal_params.shape
-        hierarchical_params = hierarchical_params[:, :, :H, :W].contiguous()
-        params = self.y_prior_fusion(
-            torch.cat((hierarchical_params, temporal_params), dim=1))
-        return params
+        with self._fallback_conv_guard(z_hat, 'prior_decoder'):
+            hierarchical_params = self.hyper_decoder(z_hat)
+            temporal_params = self.temporal_prior_encoder(ctx_t)
+            _, _, H, W = temporal_params.shape
+            hierarchical_params = hierarchical_params[:, :, :H, :W].contiguous()
+            params = self.y_prior_fusion(
+                torch.cat((hierarchical_params, temporal_params), dim=1))
+            return params
 
     def get_recon_and_feature(self, y_hat, ctx, q_decoder, q_recon):
-        feature = self.decoder(y_hat, ctx, q_decoder)
-        x_hat = self.recon_generation_net(feature, q_recon)
+        with self._fallback_conv_guard(y_hat, 'decoder'):
+            feature = self.decoder(y_hat, ctx, q_decoder)
+        with self._fallback_conv_guard(feature, 'recon_generation'):
+            x_hat = self.recon_generation_net(feature, q_recon)
         return x_hat, feature
 
     def prepare_feature_adaptor_i(self, last_qp):
         if self.dpb[0].frame is None:
             q_recon = self.q_recon[last_qp:last_qp+1, :, :, :]
-            self.dpb[0].frame = self.recon_generation_net(self.dpb[0].feature, q_recon).clamp_(0, 1)
+            with self._fallback_conv_guard(self.dpb[0].feature, 'recon_generation'):
+                self.dpb[0].frame = self.recon_generation_net(
+                    self.dpb[0].feature, q_recon
+                ).clamp_(0, 1)
             self.reset_ref_feature()
 
     def compress(self, x, qp):
@@ -305,22 +387,26 @@ class DMC(CompressionModel):
         q_feature = self.q_feature[qp:qp+1, :, :, :]
 
         feature = self.apply_feature_adaptor()
-        ctx, ctx_t = self.feature_extractor(feature, q_feature)
-        y = self.encoder(x, ctx, q_encoder)
+        ctx, ctx_t = self.extract_context(feature, q_feature)
+        with self._fallback_conv_guard(x, 'encoder'):
+            y = self.encoder(x, ctx, q_encoder)
 
         hyper_inp = self.pad_for_y(y)
 
-        z = self.hyper_encoder(hyper_inp)
+        with self._fallback_conv_guard(hyper_inp, 'hyper_encoder'):
+            z = self.hyper_encoder(hyper_inp)
         z_hat, z_hat_write = round_and_to_int8(z)
         cuda_event_z_ready = torch.cuda.Event()
         cuda_event_z_ready.record()
         params = self.res_prior_param_decoder(z_hat, ctx_t)
-        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
-            self.compress_prior_2x(y, params, self.y_spatial_prior)
+        with self._fallback_conv_guard(y, 'spatial_prior'):
+            y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+                self.compress_prior_2x(y, params, self.y_spatial_prior)
 
         cuda_event_y_ready = torch.cuda.Event()
         cuda_event_y_ready.record()
-        feature = self.decoder(y_hat, ctx, q_decoder)
+        with self._fallback_conv_guard(y_hat, 'decoder'):
+            feature = self.decoder(y_hat, ctx, q_decoder)
 
         cuda_stream = self.get_cuda_stream(device=device, priority=-1)
         with torch.cuda.stream(cuda_stream):
@@ -376,15 +462,20 @@ class DMC(CompressionModel):
         # ------------------------------------------------------------------
         # Phase 1: B=N GPU forward pass
         # ------------------------------------------------------------------
-        ctx, ctx_t = self.feature_extractor(ref_features, q_feature)
-        y = self.encoder(x_batch, ctx, q_encoder)
+        ctx, ctx_t = self.extract_context(ref_features, q_feature)
+        with self._fallback_conv_guard(x_batch, 'encoder'):
+            y = self.encoder(x_batch, ctx, q_encoder)
 
-        z = self.hyper_encoder(self.pad_for_y(y))
+        hyper_inp = self.pad_for_y(y)
+        with self._fallback_conv_guard(hyper_inp, 'hyper_encoder'):
+            z = self.hyper_encoder(hyper_inp)
         z_hat, z_hat_write = round_and_to_int8(z)
         params = self.res_prior_param_decoder(z_hat, ctx_t)
-        y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
-            self.compress_prior_2x(y, params, self.y_spatial_prior)
-        features_out = self.decoder(y_hat, ctx, q_decoder)   # [N, g_ch_d, H', W']
+        with self._fallback_conv_guard(y, 'spatial_prior'):
+            y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
+                self.compress_prior_2x(y, params, self.y_spatial_prior)
+        with self._fallback_conv_guard(y_hat, 'decoder'):
+            features_out = self.decoder(y_hat, ctx, q_decoder)   # [N, g_ch_d, H', W']
 
         # Wait for all GPU work to finish before touching results on the CPU.
         torch.cuda.synchronize(device=device)
@@ -425,17 +516,18 @@ class DMC(CompressionModel):
         self.bit_estimator_z.decode_z(z_size, qp)
 
         feature = self.apply_feature_adaptor()
-        c1, ctx_t = self.feature_extractor.forward_part1(feature, q_feature)
+        c1, ctx_t = self.extract_context_part1(feature, q_feature)
 
         z_hat = self.bit_estimator_z.get_z(z_size, device, dtype)
         params = self.res_prior_param_decoder(z_hat, ctx_t)
         infos = self.decompress_prior_2x_part1(params)
 
-        ctx = self.feature_extractor.forward_part2(c1)
+        ctx = self.extract_context_part2(c1)
 
         cuda_stream = self.get_cuda_stream(device=device, priority=-1)
         with torch.cuda.stream(cuda_stream):
-            y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
+            with self._fallback_conv_guard(c1, 'spatial_prior'):
+                y_hat = self.decompress_prior_2x_part2(params, self.y_spatial_prior, infos)
             cuda_event = torch.cuda.Event()
             cuda_event.record()
 

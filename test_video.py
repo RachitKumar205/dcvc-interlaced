@@ -14,7 +14,7 @@ import numpy as np
 from tqdm import tqdm
 
 from src.layers.cuda_inference import replicate_pad
-from src.models.video_model import DMC
+from src.models.video_model import DMC, get_fallback_guard_config
 from src.models.image_model import DMCI
 from src.utils.common import str2bool, create_folder, generate_log_json, get_state_dict, \
     dump_json, set_torch_env
@@ -427,6 +427,12 @@ def main():
     if args.cuda_idx is not None:
         cuda_device = ','.join([str(s) for s in args.cuda_idx])
         os.environ['CUDA_VISIBLE_DEVICES'] = cuda_device
+
+    guard_enabled, guard_stages = get_fallback_guard_config()
+    if guard_enabled:
+        print(f"[guard] fallback fp16 guard enabled (stages: {','.join(sorted(guard_stages))})")
+    else:
+        print("[guard] fallback fp16 guard disabled")
 
     worker_num = args.worker
     assert worker_num >= 1
