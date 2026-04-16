@@ -105,6 +105,15 @@ def get_padded_frames(frames, height, width):
     return [replicate_pad(frame, padding_b, padding_r) for frame in frames]
 
 
+def sync_and_report_memory(args, device, label):
+    if not args.verbose_mem or not str(device).startswith("cuda"):
+        return
+    torch.cuda.synchronize(device=device)
+    allocated = torch.cuda.memory_allocated(device=device) / (1024 ** 2)
+    reserved = torch.cuda.memory_reserved(device=device) / (1024 ** 2)
+    print(f"  [mem] {label:20s} allocated={allocated:8.1f} MiB  reserved={reserved:8.1f} MiB")
+
+
 def materialise_feature(model, ref_frame, use_guard):
     if ref_frame.feature is not None:
         with fallback_guard(use_guard, ref_frame.feature):
@@ -121,7 +130,7 @@ def run_compress(model, x, qp, ref_frame, use_guard):
         encoded = model.compress(x, qp)
     next_ref = RefFrame()
     next_ref.frame = None
-    next_ref.feature = model.dpb[0].feature
+    next_ref.feature = model.dpb[0].feature.detach()
     return encoded, next_ref
 
 
@@ -137,7 +146,7 @@ def run_compress_batch(model, x_batch, qp, ref_frames, use_guard):
     for idx in range(x_batch.shape[0]):
         ref = RefFrame()
         ref.frame = None
-        ref.feature = features_out[idx:idx+1]
+        ref.feature = features_out[idx:idx+1].detach()
         next_refs.append(ref)
     return streams, next_refs, ref_features
 
@@ -167,7 +176,7 @@ def feature_extractor_trace(model, feature, qp, use_guard):
 
 def clone_ref_from_iframe(x_hat):
     ref = RefFrame()
-    ref.frame = x_hat
+    ref.frame = x_hat.detach()
     ref.feature = None
     return ref
 
@@ -183,12 +192,12 @@ def maybe_prepare_adaptor_i(model, ref_frame, last_qp, use_guard):
             ).clamp_(0, 1)
         model.reset_ref_feature()
     next_ref = RefFrame()
-    next_ref.frame = model.dpb[0].frame
-    next_ref.feature = model.dpb[0].feature
+    next_ref.frame = model.dpb[0].frame.detach() if model.dpb[0].frame is not None else None
+    next_ref.feature = model.dpb[0].feature.detach() if model.dpb[0].feature is not None else None
     return next_ref
 
 
-def init_model_pair(model_path_i, model_path_p, device, dtype, use_two_ec):
+def init_image_model(model_path_i, device, dtype, use_two_ec):
     i_net = DMCI()
     i_net.load_state_dict(get_state_dict(model_path_i))
     i_net = i_net.to(device).eval()
@@ -196,7 +205,10 @@ def init_model_pair(model_path_i, model_path_p, device, dtype, use_two_ec):
         i_net.half()
     i_net.update()
     i_net.set_use_two_entropy_coders(use_two_ec)
+    return i_net
 
+
+def init_video_model(model_path_p, device, dtype, use_two_ec):
     p_net = DMC()
     p_net.load_state_dict(get_state_dict(model_path_p))
     p_net = p_net.to(device).eval()
@@ -204,7 +216,7 @@ def init_model_pair(model_path_i, model_path_p, device, dtype, use_two_ec):
         p_net.half()
     p_net.update()
     p_net.set_use_two_entropy_coders(use_two_ec)
-    return i_net, p_net
+    return p_net
 
 
 def print_verdict(label, ok, success_text, fail_text):
@@ -218,31 +230,33 @@ def run_feature_extractor_level(args):
     if not str(device).startswith("cuda"):
         raise RuntimeError("feature-extractor level requires CUDA to reproduce the bug")
 
-    with cudnn_runtime(args.cudnn == "on"):
-        i_net, p_net = init_model_pair(
-            args.model_path_i,
-            args.model_path_p,
-            device,
-            dtype,
-            use_two_ec=False,
-        )
-        frames = get_padded_frames(
-            read_frames(args.test_video, args.width, args.height, 1, device, dtype),
-            args.height,
-            args.width,
-        )
-        i_encoded = i_net.compress(frames[0], args.qp_i)
-        ref = clone_ref_from_iframe(i_encoded["x_hat"])
-        ref = maybe_prepare_adaptor_i(p_net, ref, args.qp_i, args.guard == "on")
-        ref_feature = materialise_feature(p_net, ref, args.guard == "on")
-        curr_qp = p_net.shift_qp(args.qp_p, args.index_map[1])
-        single_trace = feature_extractor_trace(
-            p_net, ref_feature[0:1].contiguous(), curr_qp, args.guard == "on"
-        )
-        pair_input = torch.cat([ref_feature[0:1], ref_feature[0:1]], dim=0)
-        pair_trace = feature_extractor_trace(p_net, pair_input, curr_qp, args.guard == "on")
+    with torch.inference_mode():
+        with cudnn_runtime(args.cudnn == "on"):
+            print("=== feature-extractor ===")
+            print("  init models")
+            i_net = init_image_model(args.model_path_i, device, dtype, use_two_ec=False)
+            p_net = init_video_model(args.model_path_p, device, dtype, use_two_ec=False)
+            sync_and_report_memory(args, device, "after model init")
+            print("  read/pad frame")
+            frames = get_padded_frames(
+                read_frames(args.test_video, args.width, args.height, 1, device, dtype),
+                args.height,
+                args.width,
+            )
+            sync_and_report_memory(args, device, "after frame load")
+            print("  seed I-frame")
+            i_encoded = i_net.compress(frames[0], args.qp_i)
+            ref = clone_ref_from_iframe(i_encoded["x_hat"])
+            ref = maybe_prepare_adaptor_i(p_net, ref, args.qp_i, args.guard == "on")
+            ref_feature = materialise_feature(p_net, ref, args.guard == "on")
+            curr_qp = p_net.shift_qp(args.qp_p, args.index_map[1])
+            sync_and_report_memory(args, device, "after I-frame seed")
+            single_trace = feature_extractor_trace(
+                p_net, ref_feature[0:1].contiguous(), curr_qp, args.guard == "on"
+            )
+            pair_input = torch.cat([ref_feature[0:1], ref_feature[0:1]], dim=0)
+            pair_trace = feature_extractor_trace(p_net, pair_input, curr_qp, args.guard == "on")
 
-        print("=== feature-extractor ===")
         first_diff = None
         for name in (
             "input",
@@ -277,54 +291,63 @@ def run_encode_level(args):
         raise RuntimeError("encode level requires CUDA to reproduce the bug")
 
     use_two_ec = (args.height * args.width) > (1280 * 720)
-    with cudnn_runtime(args.cudnn == "on"):
-        i_net, p_seq = init_model_pair(args.model_path_i, args.model_path_p, device, dtype, use_two_ec)
-        _, p_b1 = init_model_pair(args.model_path_i, args.model_path_p, device, dtype, use_two_ec)
-        _, p_b2 = init_model_pair(args.model_path_i, args.model_path_p, device, dtype, use_two_ec)
+    with torch.inference_mode():
+        with cudnn_runtime(args.cudnn == "on"):
+            print("=== encode ===")
+            print("  init models")
+            i_net = init_image_model(args.model_path_i, device, dtype, use_two_ec)
+            p_seq = init_video_model(args.model_path_p, device, dtype, use_two_ec)
+            p_b1 = init_video_model(args.model_path_p, device, dtype, use_two_ec)
+            p_b2 = init_video_model(args.model_path_p, device, dtype, use_two_ec)
+            sync_and_report_memory(args, device, "after model init")
+            print("  read/pad frames")
+            frames = get_padded_frames(
+                read_frames(args.test_video, args.width, args.height, 2, device, dtype),
+                args.height,
+                args.width,
+            )
+            sync_and_report_memory(args, device, "after frame load")
+            print("  seed I-frame")
+            i_encoded = i_net.compress(frames[0], args.qp_i)
+            ref_seq = clone_ref_from_iframe(i_encoded["x_hat"])
+            ref_b1 = clone_ref_from_iframe(i_encoded["x_hat"])
+            ref_b2_0 = clone_ref_from_iframe(i_encoded["x_hat"])
+            ref_b2_1 = clone_ref_from_iframe(i_encoded["x_hat"])
+            last_qp = args.qp_i
+            if args.reset_interval > 0 and 1 % args.reset_interval == 1:
+                ref_seq = maybe_prepare_adaptor_i(p_seq, ref_seq, last_qp, args.guard == "on")
+                ref_b1 = maybe_prepare_adaptor_i(p_b1, ref_b1, last_qp, args.guard == "on")
+                ref_b2_0 = maybe_prepare_adaptor_i(p_b2, ref_b2_0, last_qp, args.guard == "on")
+                ref_b2_1 = maybe_prepare_adaptor_i(p_b2, ref_b2_1, last_qp, args.guard == "on")
+            sync_and_report_memory(args, device, "after I-frame seed")
 
-        frames = get_padded_frames(
-            read_frames(args.test_video, args.width, args.height, 2, device, dtype),
-            args.height,
-            args.width,
-        )
-        i_encoded = i_net.compress(frames[0], args.qp_i)
-        ref_seq = clone_ref_from_iframe(i_encoded["x_hat"])
-        ref_b1 = clone_ref_from_iframe(i_encoded["x_hat"])
-        ref_b2_0 = clone_ref_from_iframe(i_encoded["x_hat"])
-        ref_b2_1 = clone_ref_from_iframe(i_encoded["x_hat"])
-        last_qp = args.qp_i
-        if args.reset_interval > 0 and 1 % args.reset_interval == 1:
-            ref_seq = maybe_prepare_adaptor_i(p_seq, ref_seq, last_qp, args.guard == "on")
-            ref_b1 = maybe_prepare_adaptor_i(p_b1, ref_b1, last_qp, args.guard == "on")
-            ref_b2_0 = maybe_prepare_adaptor_i(p_b2, ref_b2_0, last_qp, args.guard == "on")
-            ref_b2_1 = maybe_prepare_adaptor_i(p_b2, ref_b2_1, last_qp, args.guard == "on")
+            curr_qp = p_seq.shift_qp(args.qp_p, args.index_map[1])
 
-        curr_qp = p_seq.shift_qp(args.qp_p, args.index_map[1])
+            mat_seq = materialise_feature(p_seq, ref_seq, args.guard == "on")
+            mat_b1 = materialise_feature(p_b1, ref_b1, args.guard == "on")
+            mat_b2_0 = materialise_feature(p_b2, ref_b2_0, args.guard == "on")
+            mat_b2_1 = materialise_feature(p_b2, ref_b2_1, args.guard == "on")
 
-        mat_seq = materialise_feature(p_seq, ref_seq, args.guard == "on")
-        mat_b1 = materialise_feature(p_b1, ref_b1, args.guard == "on")
-        mat_b2_0 = materialise_feature(p_b2, ref_b2_0, args.guard == "on")
-        mat_b2_1 = materialise_feature(p_b2, ref_b2_1, args.guard == "on")
+            print("  run P-frame comparison")
+            seq_encoded, ref_seq = run_compress(p_seq, frames[1], curr_qp, ref_seq, args.guard == "on")
+            b1_streams, b1_refs, _ = run_compress_batch(
+                p_b1,
+                frames[1],
+                curr_qp,
+                [ref_b1],
+                args.guard == "on",
+            )
+            ref_b1 = b1_refs[0]
+            b2_streams, b2_refs, _ = run_compress_batch(
+                p_b2,
+                torch.cat([frames[1], frames[1]], dim=0),
+                curr_qp,
+                [ref_b2_0, ref_b2_1],
+                args.guard == "on",
+            )
+            ref_b2_0, ref_b2_1 = b2_refs
+            sync_and_report_memory(args, device, "after P-frame")
 
-        seq_encoded, ref_seq = run_compress(p_seq, frames[1], curr_qp, ref_seq, args.guard == "on")
-        b1_streams, b1_refs, _ = run_compress_batch(
-            p_b1,
-            frames[1],
-            curr_qp,
-            [ref_b1],
-            args.guard == "on",
-        )
-        ref_b1 = b1_refs[0]
-        b2_streams, b2_refs, _ = run_compress_batch(
-            p_b2,
-            torch.cat([frames[1], frames[1]], dim=0),
-            curr_qp,
-            [ref_b2_0, ref_b2_1],
-            args.guard == "on",
-        )
-        ref_b2_0, ref_b2_1 = b2_refs
-
-        print("=== encode ===")
         print_diff("mat_seq_vs_b1", mat_seq, mat_b1)
         print_diff("mat_seq_vs_b2", mat_seq, mat_b2_0)
         print_diff("b2_slot_internal", mat_b2_0, mat_b2_1)
@@ -346,72 +369,83 @@ def run_full_level(args):
         raise RuntimeError("full level requires CUDA to reproduce the bug")
 
     use_two_ec = (args.height * args.width) > (1280 * 720)
-    with cudnn_runtime(args.cudnn == "on"):
-        i_net, p_seq = init_model_pair(args.model_path_i, args.model_path_p, device, dtype, use_two_ec)
-        _, p_b1 = init_model_pair(args.model_path_i, args.model_path_p, device, dtype, use_two_ec)
-        _, p_b2 = init_model_pair(args.model_path_i, args.model_path_p, device, dtype, use_two_ec)
+    with torch.inference_mode():
+        with cudnn_runtime(args.cudnn == "on"):
+            print("=== full ===")
+            print("  init models")
+            i_net = init_image_model(args.model_path_i, device, dtype, use_two_ec)
+            p_seq = init_video_model(args.model_path_p, device, dtype, use_two_ec)
+            p_b1 = init_video_model(args.model_path_p, device, dtype, use_two_ec)
+            p_b2 = init_video_model(args.model_path_p, device, dtype, use_two_ec)
+            sync_and_report_memory(args, device, "after model init")
 
-        frames = get_padded_frames(
-            read_frames(args.test_video, args.width, args.height, args.num_frames, device, dtype),
-            args.height,
-            args.width,
-        )
-        i_encoded = i_net.compress(frames[0], args.qp_i)
-        ref_seq = clone_ref_from_iframe(i_encoded["x_hat"])
-        ref_b1 = clone_ref_from_iframe(i_encoded["x_hat"])
-        ref_b2_0 = clone_ref_from_iframe(i_encoded["x_hat"])
-        ref_b2_1 = clone_ref_from_iframe(i_encoded["x_hat"])
-        last_qp = args.qp_i
-
-        print("=== full ===")
-        first_fail = None
-        for frame_idx in range(1, len(frames)):
-            if args.reset_interval > 0 and frame_idx % args.reset_interval == 1:
-                ref_seq = maybe_prepare_adaptor_i(p_seq, ref_seq, last_qp, args.guard == "on")
-                ref_b1 = maybe_prepare_adaptor_i(p_b1, ref_b1, last_qp, args.guard == "on")
-                ref_b2_0 = maybe_prepare_adaptor_i(p_b2, ref_b2_0, last_qp, args.guard == "on")
-                ref_b2_1 = maybe_prepare_adaptor_i(p_b2, ref_b2_1, last_qp, args.guard == "on")
-
-            curr_qp = p_seq.shift_qp(args.qp_p, args.index_map[frame_idx % 8])
-            mat_seq = materialise_feature(p_seq, ref_seq, args.guard == "on")
-            mat_b1 = materialise_feature(p_b1, ref_b1, args.guard == "on")
-            mat_b2_0 = materialise_feature(p_b2, ref_b2_0, args.guard == "on")
-
-            seq_encoded, ref_seq = run_compress(
-                p_seq, frames[frame_idx], curr_qp, ref_seq, args.guard == "on"
+            print("  read/pad frames")
+            frames = get_padded_frames(
+                read_frames(args.test_video, args.width, args.height, args.num_frames, device, dtype),
+                args.height,
+                args.width,
             )
-            b1_streams, b1_refs, _ = run_compress_batch(
-                p_b1, frames[frame_idx], curr_qp, [ref_b1], args.guard == "on"
-            )
-            ref_b1 = b1_refs[0]
-            b2_streams, b2_refs, _ = run_compress_batch(
-                p_b2,
-                torch.cat([frames[frame_idx], frames[frame_idx]], dim=0),
-                curr_qp,
-                [ref_b2_0, ref_b2_1],
-                args.guard == "on",
-            )
-            ref_b2_0, ref_b2_1 = b2_refs
-            last_qp = curr_qp
+            sync_and_report_memory(args, device, "after frame load")
 
-            mat_b1_diff = tensor_diff(mat_seq, mat_b1)[0]
-            mat_b2_diff = tensor_diff(mat_seq, mat_b2_0)[0]
-            feat_b1_diff = tensor_diff(ref_seq.feature, ref_b1.feature)[0]
-            feat_b2_diff = tensor_diff(ref_seq.feature, ref_b2_0.feature)[0]
-            bits_b1 = seq_encoded["bit_stream"] == b1_streams[0]
-            bits_b2 = seq_encoded["bit_stream"] == b2_streams[0]
-            print(
-                f"  frame {frame_idx:3d}  "
-                f"mat_b1={mat_b1_diff:.4e}  mat_b2={mat_b2_diff:.4e}  "
-                f"bits_b1={'yes' if bits_b1 else 'NO'}  bits_b2={'yes' if bits_b2 else 'NO'}  "
-                f"feat_b1={feat_b1_diff:.4e}  feat_b2={feat_b2_diff:.4e}"
-            )
+            print("  seed I-frame")
+            i_encoded = i_net.compress(frames[0], args.qp_i)
+            ref_seq = clone_ref_from_iframe(i_encoded["x_hat"])
+            ref_b1 = clone_ref_from_iframe(i_encoded["x_hat"])
+            ref_b2_0 = clone_ref_from_iframe(i_encoded["x_hat"])
+            ref_b2_1 = clone_ref_from_iframe(i_encoded["x_hat"])
+            last_qp = args.qp_i
+            sync_and_report_memory(args, device, "after I-frame seed")
 
-            if first_fail is None:
-                if mat_b1_diff > args.threshold or mat_b2_diff > args.threshold or \
-                        feat_b1_diff > args.threshold or feat_b2_diff > args.threshold or \
-                        (not bits_b1) or (not bits_b2):
-                    first_fail = frame_idx
+            print("  enter frame loop")
+            first_fail = None
+            for frame_idx in range(1, len(frames)):
+                if args.reset_interval > 0 and frame_idx % args.reset_interval == 1:
+                    ref_seq = maybe_prepare_adaptor_i(p_seq, ref_seq, last_qp, args.guard == "on")
+                    ref_b1 = maybe_prepare_adaptor_i(p_b1, ref_b1, last_qp, args.guard == "on")
+                    ref_b2_0 = maybe_prepare_adaptor_i(p_b2, ref_b2_0, last_qp, args.guard == "on")
+                    ref_b2_1 = maybe_prepare_adaptor_i(p_b2, ref_b2_1, last_qp, args.guard == "on")
+
+                curr_qp = p_seq.shift_qp(args.qp_p, args.index_map[frame_idx % 8])
+                mat_seq = materialise_feature(p_seq, ref_seq, args.guard == "on")
+                mat_b1 = materialise_feature(p_b1, ref_b1, args.guard == "on")
+                mat_b2_0 = materialise_feature(p_b2, ref_b2_0, args.guard == "on")
+
+                seq_encoded, ref_seq = run_compress(
+                    p_seq, frames[frame_idx], curr_qp, ref_seq, args.guard == "on"
+                )
+                b1_streams, b1_refs, _ = run_compress_batch(
+                    p_b1, frames[frame_idx], curr_qp, [ref_b1], args.guard == "on"
+                )
+                ref_b1 = b1_refs[0]
+                b2_streams, b2_refs, _ = run_compress_batch(
+                    p_b2,
+                    torch.cat([frames[frame_idx], frames[frame_idx]], dim=0),
+                    curr_qp,
+                    [ref_b2_0, ref_b2_1],
+                    args.guard == "on",
+                )
+                ref_b2_0, ref_b2_1 = b2_refs
+                last_qp = curr_qp
+
+                mat_b1_diff = tensor_diff(mat_seq, mat_b1)[0]
+                mat_b2_diff = tensor_diff(mat_seq, mat_b2_0)[0]
+                feat_b1_diff = tensor_diff(ref_seq.feature, ref_b1.feature)[0]
+                feat_b2_diff = tensor_diff(ref_seq.feature, ref_b2_0.feature)[0]
+                bits_b1 = seq_encoded["bit_stream"] == b1_streams[0]
+                bits_b2 = seq_encoded["bit_stream"] == b2_streams[0]
+                print(
+                    f"  frame {frame_idx:3d}  "
+                    f"mat_b1={mat_b1_diff:.4e}  mat_b2={mat_b2_diff:.4e}  "
+                    f"bits_b1={'yes' if bits_b1 else 'NO'}  bits_b2={'yes' if bits_b2 else 'NO'}  "
+                    f"feat_b1={feat_b1_diff:.4e}  feat_b2={feat_b2_diff:.4e}"
+                )
+                sync_and_report_memory(args, device, f"frame {frame_idx}")
+
+                if first_fail is None:
+                    if mat_b1_diff > args.threshold or mat_b2_diff > args.threshold or \
+                            feat_b1_diff > args.threshold or feat_b2_diff > args.threshold or \
+                            (not bits_b1) or (not bits_b2):
+                        first_fail = frame_idx
 
         print_verdict("full", first_fail is None, "SUPPRESSED BY GUARD / RUNTIME", "REPRODUCED")
         if first_fail is None:
@@ -436,6 +470,7 @@ def parse_args():
     parser.add_argument("--reset_interval", type=int, default=32)
     parser.add_argument("--num_frames", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=1e-3)
+    parser.add_argument("--verbose_mem", action="store_true")
     args = parser.parse_args()
     args.index_map = [0, 1, 0, 2, 0, 2, 0, 2]
     return args
@@ -453,6 +488,7 @@ def main():
     print(f"qp_i                      {args.qp_i}")
     print(f"qp_p                      {args.qp_p}")
     print(f"reset_interval            {args.reset_interval}")
+    print(f"verbose_mem               {args.verbose_mem}")
     print()
 
     if args.level in ("all", "full"):
