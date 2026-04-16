@@ -114,14 +114,6 @@ def get_src_frame(args, src_reader, device):
     return x, y, u, v, rgb
 
 
-def get_src_frame_for_preload(args, src_reader):
-    """
-    Read one source frame for interlaced mode, keeping the tensor on CPU so we
-    do not pin an entire sequence in GPU memory before encoding starts.
-    """
-    return get_src_frame(args, src_reader, "cpu")
-
-
 def get_distortion(args, x_hat, y, u, v, rgb):
     if args['src_type'] == 'yuv420':
         y_rec, uv_rec = yuv_444_to_420(x_hat)
@@ -260,13 +252,11 @@ def encode_interlaced(p_frame_net, i_frame_net, args, frames, pic_height, pic_wi
         odd_orig_idx  = pair_idx * 2 + 1   # original frame index for stream B
 
         x_even, _, _, _, _ = frames[even_orig_idx]
-        x_even = x_even.to(device=device, non_blocking=True)
         x_even_padded = replicate_pad(x_even, padding_b, padding_r)
 
         has_odd = (odd_orig_idx < frame_num)
         if has_odd:
             x_odd, _, _, _, _ = frames[odd_orig_idx]
-            x_odd = x_odd.to(device=device, non_blocking=True)
             x_odd_padded = replicate_pad(x_odd, padding_b, padding_r)
 
         torch.cuda.synchronize(device=device) if torch.cuda.is_available() else None
@@ -551,13 +541,12 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, args):
 
     start_time = time.time()
 
-    # --- Read all frames upfront on CPU ---
-    # We need random access to frames for interlaced pairing, but keeping the
-    # full sequence on GPU can blow up memory for 1080p runs.
+    # --- Read all frames upfront ---
+    # We need random access to frames for interlaced pairing.
     src_reader = get_src_reader(args)
     frames = []
     for _ in range(frame_num):
-        frame_data = get_src_frame_for_preload(args, src_reader)
+        frame_data = get_src_frame(args, src_reader, device)
         frames.append(frame_data)
     src_reader.close()
 
@@ -692,12 +681,7 @@ def init_func(args, gpu_num):
     set_torch_env()
 
     process_name = multiprocessing.current_process().name
-    process_idx = 0
-    if '-' in process_name:
-        try:
-            process_idx = int(process_name[process_name.rfind('-') + 1:])
-        except ValueError:
-            process_idx = 0
+    process_idx = int(process_name[process_name.rfind('-') + 1:])
     gpu_id = -1
     if gpu_num > 0:
         gpu_id = process_idx % gpu_num
@@ -757,6 +741,12 @@ def main():
     if args.cuda:
         gpu_num = torch.cuda.device_count()
 
+    multiprocessing.set_start_method("spawn")
+    threadpool_executor = concurrent.futures.ProcessPoolExecutor(
+        max_workers=worker_num,
+        initializer=init_func,
+        initargs=(args, gpu_num)
+    )
     objs = []
 
     count_frames = 0
@@ -823,26 +813,13 @@ def main():
 
                 count_frames += cur_args['frame_num']
 
-                objs.append(cur_args)
+                obj = threadpool_executor.submit(worker, cur_args)
+                objs.append(obj)
 
     results = []
-    if worker_num == 1:
-        init_func(args, gpu_num)
-        for job_args in tqdm(objs):
-            results.append(worker(job_args))
-    else:
-        multiprocessing.set_start_method("spawn")
-        threadpool_executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=worker_num,
-            initializer=init_func,
-            initargs=(args, gpu_num)
-        )
-        try:
-            futures = [threadpool_executor.submit(worker, job_args) for job_args in objs]
-            for obj in tqdm(futures):
-                results.append(obj.result())
-        finally:
-            threadpool_executor.shutdown(wait=True)
+    for obj in tqdm(objs):
+        result = obj.result()
+        results.append(result)
 
     log_result = {}
     for ds_name in config:
